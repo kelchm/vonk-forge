@@ -2056,9 +2056,12 @@ def test_exact_recipe_run_observation_grant_api_is_strict_and_authenticated(
     class ExactObservationAuthority:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
+            self.reject = False
 
         def issue_recipe_run_observation_grant(self, **values):
             self.calls.append(values)
+            if self.reject:
+                raise ValueError("running identity or authority is invalid")
             assert values["certificate_serial"] == "serial-a"
             assert values["expires_in_seconds"] == 10
             return "f" * 64, Grant()
@@ -2215,6 +2218,65 @@ def test_exact_recipe_run_observation_grant_api_is_strict_and_authenticated(
     assert too_early.status_code == 425
     assert too_early.json() == {"detail": "recipe run observation is not ready"}
     assert len(authority.calls) == 2
+
+    # These are Controller-known, authenticated transitions, not grants. A
+    # stopping retained rank must not poison another live exact assignment.
+    for state in ("stopping", "stopped"):
+        with services.sessions.begin() as session:
+            session.get(RecipeRun, starting_run_id).state = state
+            node = session.scalar(
+                select(RunNode).where(RunNode.run_id == starting_run_id)
+            )
+            node.state = state
+        response = client.post(
+            "/agent/v1/recipe-runs/observation-grants",
+            headers=agent_headers(NODE_A, "serial-a"),
+            json=starting_request,
+        )
+        assert response.status_code == 425
+        assert response.json() == {"detail": "recipe run observation is not ready"}
+        assert len(authority.calls) == 2
+        assert "grant" not in response.json()
+
+    authority.reject = True
+    # A running assignment with a failed/stopped rank or wrong identity still
+    # reaches the normal authority validator and preserves its rejection.
+    for rank_state in ("failed", "stopped", "running"):
+        with services.sessions.begin() as session:
+            session.get(RecipeRun, starting_run_id).state = "running"
+            session.scalar(
+                select(RunNode).where(RunNode.run_id == starting_run_id)
+            ).state = rank_state
+        before = len(authority.calls)
+        response = client.post(
+            "/agent/v1/recipe-runs/observation-grants",
+            headers=agent_headers(NODE_A, "serial-a"),
+            json={**starting_request, "runtime_arguments_sha256": "0" * 64},
+        )
+        assert response.status_code == 409
+        assert len(authority.calls) == before + 1
+
+    with services.sessions.begin() as session:
+        session.get(RecipeRun, starting_run_id).state = "stopped"
+        node = session.scalar(select(RunNode).where(RunNode.run_id == starting_run_id))
+        node.node_id = NODE_B
+    # A stopped run assigned elsewhere is not our expected transition.
+    foreign = client.post(
+        "/agent/v1/recipe-runs/observation-grants",
+        headers=agent_headers(NODE_A, "serial-a"),
+        json=starting_request,
+    )
+    missing = client.post(
+        "/agent/v1/recipe-runs/observation-grants",
+        headers=agent_headers(NODE_A, "serial-a"),
+        json=request,
+    )
+    wrong_node = client.post(
+        "/agent/v1/recipe-runs/observation-grants",
+        headers=agent_headers(NODE_A, "serial-a"),
+        json={**starting_request, "node_id": NODE_B},
+    )
+    assert foreign.status_code == missing.status_code == wrong_node.status_code == 409
 
 
 def test_obsolete_enrollment_decision_routes_are_not_exposed(agent_system) -> None:
@@ -3928,3 +3990,173 @@ def test_enrollment_listing_paginates_stably_and_can_filter_issuing(
         "/api/v1/agents/enrollments?state=issuing", headers=admin_headers(codec)
     ).json()
     assert [item["state"] for item in issuing["enrollments"]] == ["issuing"]
+
+
+@pytest.mark.parametrize("stop_state", ["stopping", "stopped"])
+def test_exact_report_after_stop_validates_prior_receipt_without_poisoning_other_run(
+    agent_system,
+    tmp_path,
+    stop_state,
+) -> None:
+    from vonk_control.host_helper_authority import (
+        HostHelperGrantIssuer,
+        HostRuntimeAuthorityService,
+    )
+    from vonk_control.models import Job, RecipeInstallation, RecipeRunObservationGrant
+
+    from .test_recipe_operations import (
+        NOW,
+        installed_recipe,
+        setup_services,
+        signed_observation_receipt,
+        started_recipe,
+    )
+
+    client, api_services, _, _ = agent_system
+    sessions, service, _, mapping_id, build_id, nodes = setup_services(
+        tmp_path,
+        nodes=2,
+        distributed_lifecycle=True,
+    )
+    installation = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id="7" * 36
+    )
+    stopping = started_recipe(
+        sessions,
+        service,
+        installation.owner_id,
+        nodes,
+        request_id="8" * 36,
+        alias="stop-race",
+    )
+    now = NOW + timedelta(seconds=1)
+    authority = HostRuntimeAuthorityService(
+        sessions,
+        HostHelperGrantIssuer(ed25519.Ed25519PrivateKey.generate(), clock=lambda: now),
+        clock=lambda: now,
+    )
+    object.__setattr__(api_services, "sessions", sessions)
+    object.__setattr__(api_services, "clock", lambda: now)
+    object.__setattr__(api_services, "host_runtime_authority", authority)
+    node_id = nodes[1]
+    headers = {
+        **agent_headers(node_id, "serial-1"),
+        "x-vonk-agent-fingerprint": "fingerprint-1",
+    }
+
+    def inspected(start):
+        with sessions() as session:
+            run = session.get(RecipeRun, start.owner_id)
+            installed = session.get(RecipeInstallation, run.installation_id)
+            rank = session.scalar(
+                select(RunNode).where(
+                    RunNode.run_id == run.id, RunNode.node_id == node_id
+                )
+            )
+            launch = session.get(Job, start.id).result["launch_evidence"][node_id]
+            identity = {
+                "schema_version": 1,
+                "node_id": node_id,
+                "run_id": run.id,
+                "installation_id": installed.id,
+                "recipe_revision_id": installed.recipe_revision_id,
+                "recipe_content_sha256": launch["recipe_content_sha256"],
+                "mapping_id": run.mapping_id,
+                "mapping_generation": run.mapping_generation,
+                "run_generation": run.run_generation,
+                "image_digest": launch["image_digest"],
+                "artifact_set_digest": launch["artifact_set_digest"],
+                "model_identity": launch["model_identity"],
+                "rank": rank.rank,
+                "role": rank.role,
+                "world_size": launch["world_size"],
+                "local_address": launch["local_address"],
+                "master_address": launch["master_address"],
+                "master_port": launch["master_port"],
+                "port": rank.port,
+                "runtime_arguments_sha256": launch["runtime_arguments_sha256"],
+            }
+        digest, grant = authority.issue_recipe_run_observation_grant(
+            node_id=node_id,
+            certificate_serial="serial-1",
+            identity=identity,
+            job_id=start.owner_id,
+            operation_id=str(uuid.uuid4()),
+            attempt=1,
+            fence=str(uuid.uuid4()),
+            request_sha256="d" * 64,
+            expires_in_seconds=10,
+        )
+        return {
+            **identity,
+            "observed_at": now.isoformat(),
+            "observation_identity_sha256": digest,
+            "endpoint_ready": None,
+            "grant": grant.to_mapping(),
+            "helper_receipt": signed_observation_receipt(
+                grant, digest, node_id=node_id, observed_at=now
+            ),
+        }
+
+    old_evidence = inspected(stopping)
+    stop_plan = service.preview_stop(stopping.owner_id)
+    stop = service.stop(
+        stopping.owner_id,
+        plan_digest=stop_plan.plan_digest,
+        actor="admin",
+        request_id="6" * 36,
+    )
+    for node in nodes:
+        service.record_node_result(
+            stop.id, node, succeeded=True, evidence={"stopped": True}
+        )
+    live = started_recipe(
+        sessions,
+        service,
+        installation.owner_id,
+        nodes,
+        request_id="9" * 36,
+        alias="still-live",
+    )
+    evidence = [old_evidence, inspected(live)]
+    # The first genuine inspection completed before stop; the next run has its
+    # independently issued and signed evidence after normal admission resumed.
+    with sessions.begin() as session:
+        session.get(RecipeRun, stopping.owner_id).state = stop_state
+
+    def report(items):
+        return client.post(
+            "/agent/v1/recipe-runs/observations",
+            headers=headers,
+            json={"schema_version": 2, "observed_at": now.isoformat(), "runs": items},
+        )
+
+    assert report(evidence).status_code == 422  # mixed batches stay strict
+    forged = copy.deepcopy(evidence[0])
+    forged["helper_receipt"]["signature"]["value"] = "0" * 128
+    assert report([forged]).status_code == 422
+    wrong = {**evidence[0], "runtime_arguments_sha256": "0" * 64}
+    assert report([wrong]).status_code == 422
+    response = report([evidence[0]])
+    assert response.status_code == 425, response.text
+    with sessions() as session:
+        for start in (stopping, live):
+            rank = session.scalar(
+                select(RunNode).where(
+                    RunNode.run_id == start.owner_id, RunNode.node_id == node_id
+                )
+            )
+            assert rank.state == ("stopped" if start is stopping else "running")
+            assert rank.updated_at.replace(tzinfo=UTC) == NOW
+            assert session.get(RecipeRunObservationGrant, rank.id).consumed is False
+    accepted = report([evidence[1]])
+    assert accepted.status_code == 204, accepted.text
+    with sessions() as session:
+        rank = session.scalar(
+            select(RunNode).where(
+                RunNode.run_id == live.owner_id, RunNode.node_id == node_id
+            )
+        )
+        assert rank.state == "running"
+        assert rank.updated_at.replace(tzinfo=UTC) == now
+        assert session.get(RecipeRunObservationGrant, rank.id).consumed is True
