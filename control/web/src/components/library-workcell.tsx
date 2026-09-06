@@ -142,7 +142,7 @@ export function applyManagedCatalogWithdrawals(
     ...(node.loaded ?? []).map(item => item.recipe_id),
   ]) ?? []);
   return records.map(record => {
-    const recipeId = record.recipe?.recipe_id;
+    const recipeId = localRecipeId(record);
     const withdrawal = recipeId ? withdrawalsByRecipe.get(recipeId) : undefined;
     if (!withdrawal) return record;
     return {
@@ -258,8 +258,12 @@ function groupForNode(detail: LibraryRecipeDetail, nodeId: string): LibraryPlace
   return detail.placement.flatMap(placement => placement.recommendations).find(group => group.eligible && group.group_complete && group.node_ids.includes(nodeId));
 }
 
+function localRecipeId(record: LibraryRecipeRecord): string | undefined {
+  return record.recipe?.recipe_id ?? (record.catalog?.local.status !== "not-imported" ? record.catalog?.local.recipe_id ?? undefined : undefined);
+}
+
 function selectionRecipeIds(records: LibraryRecipeRecord[]): Set<string> {
-  return new Set(records.flatMap(record => record.recipe ? [record.recipe.recipe_id] : []));
+  return new Set(records.flatMap(record => { const id = localRecipeId(record); return id ? [id] : []; }));
 }
 
 export type SparkPlacementState = "available" | "installed" | "running" | "running-attention" | "update" | "withdrawn" | "incompatible" | "offline" | "select";
@@ -268,7 +272,7 @@ export function sparkPlacementState(node: VisualFleetNode, selectedRecords: Libr
   if (node.connection?.online_state !== "online") return "offline";
   if (selectedRecords.length === 0) return "select";
   const ids = selectionRecipeIds(selectedRecords);
-  const withdrawnIds = new Set(selectedRecords.flatMap(record => record.withdrawnInstalled && record.recipe ? [record.recipe.recipe_id] : []));
+  const withdrawnIds = new Set(selectedRecords.flatMap(record => record.withdrawnInstalled && localRecipeId(record) ? [localRecipeId(record)!] : []));
   if ((node.loaded ?? []).some(run => withdrawnIds.has(run.recipe_id)) || (node.installed ?? []).some(installation => withdrawnIds.has(installation.recipe_id) && installation.rank_state === "installed")) return "withdrawn";
   const selectedRuns = (node.loaded ?? []).filter(run => ids.has(run.recipe_id));
   if (selectedRuns.some(run => run.healthy === false)) return "running-attention";
@@ -300,10 +304,10 @@ function formattedSyncTime(value: string | null): string {
 }
 
 function installedNodeIds(record: LibraryRecipeRecord, fleet: VisualFleetSnapshot | undefined): string[] {
-  if (!record.recipe || !fleet) return [];
+  if (!localRecipeId(record) || !fleet) return [];
   return fleet.nodes.flatMap(node =>
-    (node.installed ?? []).some(item => item.recipe_id === record.recipe?.recipe_id && item.rank_state === "installed")
-      || (node.loaded ?? []).some(item => item.recipe_id === record.recipe?.recipe_id)
+    (node.installed ?? []).some(item => item.recipe_id === localRecipeId(record) && item.rank_state === "installed")
+      || (node.loaded ?? []).some(item => item.recipe_id === localRecipeId(record))
       ? [node.id] : [],
   );
 }
@@ -363,7 +367,7 @@ export function LibraryWorkcell({
     .filter(record => !filters.installedOn
       || (filters.installedOn === "not-installed" ? installedNodeIds(record, fleet).length === 0 : installedNodeIds(record, fleet).includes(filters.installedOn))), [allRecords, filters, fleet, query]);
   const models = useMemo(() => deriveLibraryModels(matchingRecords), [matchingRecords]);
-  const selectedRecord = route.kind === "recipe" ? allRecords.find(record => record.recipe?.recipe_id === route.recipeId) : undefined;
+  const selectedRecord = route.kind === "recipe" ? allRecords.find(record => localRecipeId(record) === route.recipeId) : undefined;
   const selectedModelKey = route.kind === "model" ? (route.unlinked ? "unlinked" : route.modelKey) : selectedRecord?.modelKey;
   const visibleRecords = route.kind === "model" && route.unlinked
     ? matchingRecords.filter(record => record.modelKey === "unlinked")
@@ -376,11 +380,12 @@ export function LibraryWorkcell({
     ...(node.installed ?? []).flatMap(installation => selectedModelRecipeIds.has(installation.recipe_id) && installation.rank_state === "installed" ? [installation.recipe_id] : []),
     ...(node.loaded ?? []).flatMap(run => selectedModelRecipeIds.has(run.recipe_id) ? [run.recipe_id] : []),
   ]) ?? []).size;
-  const activeDetail = detail && selectedRecord?.recipe && detail.recipe.recipe_id === selectedRecord.recipe.recipe_id ? detail : placementDetail;
-  const selectedRecipeDetail = detail && selectedRecord?.recipe && detail.recipe.recipe_id === selectedRecord.recipe.recipe_id ? detail : undefined;
+  const selectedRecipeId = selectedRecord && localRecipeId(selectedRecord);
+  const activeDetail = detail && detail.recipe.recipe_id === selectedRecipeId ? detail : placementDetail;
+  const selectedRecipeDetail = detail && detail.recipe.recipe_id === selectedRecipeId ? detail : undefined;
   const selectedInstallations = selectedRecipeDetail?.operational_state.installations.filter(installation => installation.state !== "uninstalled") ?? [];
   const selectedActiveRuns = selectedRecipeDetail?.operational_state.runs.filter(run => ["running", "published"].includes(run.state)) ?? [];
-  const selectedHasFleetRun = Boolean(selectedRecord?.recipe && fleet?.nodes.some(node => (node.loaded ?? []).some(run => run.recipe_id === selectedRecord.recipe?.recipe_id)));
+  const selectedHasFleetRun = Boolean(selectedRecipeId && fleet?.nodes.some(node => (node.loaded ?? []).some(run => run.recipe_id === selectedRecipeId)));
   const selectedHasActiveRun = selectedActiveRuns.length > 0 || selectedHasFleetRun;
   const creators = valueOptions(publicRecipes.map(recipe => recipe.source_owner));
   const repositories = valueOptions(publicRecipes.map(recipe => recipe.source_repository));
@@ -391,7 +396,7 @@ export function LibraryWorkcell({
     .filter(record => !filters.modelFamily || recordModelFamily(record) === filters.modelFamily)
     .map(record => [record.modelKey, record.modelTitle])).entries()];
   const appliedFilterCount = Object.entries(filters).reduce((count, [, value]) => count + (Array.isArray(value) ? value.length : value ? 1 : 0), 0);
-  const installedWithdrawalCount = new Set(allRecords.flatMap(record => record.withdrawnInstalled && record.recipe ? [record.recipe.recipe_id] : [])).size;
+  const installedWithdrawalCount = new Set(allRecords.flatMap(record => record.withdrawnInstalled && localRecipeId(record) ? [localRecipeId(record)!] : [])).size;
   const syncTime = formattedSyncTime(syncSummary?.completed_at ?? null);
   const staleInstallationCount = syncSummary?.stale_recipes.reduce((count, item) => count + item.stale_installation_count, 0) ?? 0;
   const staleRunCount = syncSummary?.stale_recipes.reduce((count, item) => count + item.stale_run_count, 0) ?? 0;
@@ -532,14 +537,15 @@ export function LibraryWorkcell({
             </tr></thead>
             <tbody>{visibleRecords.map(record => {
               const catalog = record.catalog;
+              const recipeId = localRecipeId(record);
               const locations = installedNodeIds(record, fleet).map(nodeId => { const node = fleet?.nodes.find(item => item.id === nodeId); return node ? nodeDisplayName(node) : nodeId; });
               return <tr className={selectedRecord?.key === record.key ? "is-selected" : ""} key={record.key} draggable={Boolean(record.recipe)} onDragStart={event => onDragStart(event, record)} onDragEnd={() => { setDraggedRecipe(undefined); setDropNodeId(""); }}>
                 <td>{locations.length ? locations.join(" · ") : "Not installed"}</td>
-                <td>{record.recipe ? <a aria-current={selectedRecord?.key === record.key ? "page" : undefined} href={recipeLibraryPath(record.recipe.recipe_id)} onClick={event => onNavigate(event, recipeLibraryPath(record.recipe!.recipe_id))}>{record.title}</a> : <strong>{record.title}</strong>}<small>{releaseStatus(record)}</small></td>
+                <td>{recipeId ? <a aria-current={selectedRecord?.key === record.key ? "page" : undefined} href={recipeLibraryPath(recipeId)} onClick={event => onNavigate(event, recipeLibraryPath(recipeId))}>{record.title}</a> : <strong>{record.title}</strong>}<small>{releaseStatus(record)}</small></td>
                 <td>{recordModelFamily(record)}</td><td>{record.modelTitle}</td><td>{catalog?.quantizations.join(" · ") || "—"}</td><td>{catalog ? humanizeIdentifier(catalog.runtime_distribution) : "—"}</td><td>{recordIsAbliterated(record) ? "True" : "False"}</td><td>{catalog?.node_count ?? "—"}</td><td>{catalog?.source_owner ?? "—"}</td><td>{catalog?.release_released_at ?? "—"}</td>
                 <td>{catalog ? humanizeIdentifier(catalog.execution_readiness) : "—"}</td><td>{recordCapabilities(record).map(value => CAPABILITIES.find(option => option.value === value)?.label ?? value).join(" · ") || "—"}</td><td>{catalog ? (catalog.qualification === "cataloged" ? "Accepted" : "Candidate") : "Custom"}</td><td>{catalog?.source_repository ? <a href={catalog.source_repository} target="_blank" rel="noreferrer">{repositoryLabel(catalog.source_repository)}<span className="visually-hidden"> opens in a new tab</span></a> : "—"}</td>
                 <td>{catalog ? formatBytes(catalog.expected_download_bytes) : "—"}</td><td>{catalog ? formatBytes(catalog.maximum_installed_bytes_per_node) : "—"}</td><td>{catalog ? formatBytes(catalog.maximum_runtime_memory_bytes_per_node) : "—"}</td>
-                <td><button type="button" className="button secondary" disabled={!record.recipe} title={!record.recipe ? "Waiting for automatic repository synchronization." : undefined} onClick={event => { placementTrigger.current = event.currentTarget; void preparePlacement(record); }}>{placementRecipe?.key === record.key ? (placementLoading ? "Checking Sparks…" : "Choose a Spark") : record.recipe ? "Place on Spark" : "Syncing…"}</button></td>
+                <td>{!record.recipe && recipeId ? <a className="button secondary" href={recipeLibraryPath(recipeId)} onClick={event => onNavigate(event, recipeLibraryPath(recipeId))}>Open recipe</a> : <button type="button" className="button secondary" disabled={!record.recipe} title={!record.recipe ? "Waiting for automatic repository synchronization." : undefined} onClick={event => { placementTrigger.current = event.currentTarget; void preparePlacement(record); }}>{placementRecipe?.key === record.key ? (placementLoading ? "Checking Sparks…" : "Choose a Spark") : record.recipe ? "Place on Spark" : "Syncing…"}</button>}</td>
               </tr>;
             })}</tbody>
           </table>
@@ -571,8 +577,8 @@ export function LibraryWorkcell({
           const stateRecords = railRecord ? [railRecord] : selectedRecords;
           const stateRecipeIds = selectionRecipeIds(stateRecords);
           const activeSelectedRun = (node.loaded ?? []).some(run => stateRecipeIds.has(run.recipe_id));
-          const runningRecords = stateRecords.filter(record => record.recipe && (node.loaded ?? []).some(run => run.recipe_id === record.recipe?.recipe_id));
-          const installedRecords = stateRecords.filter(record => record.recipe && !runningRecords.includes(record) && (node.installed ?? []).some(installation => installation.recipe_id === record.recipe?.recipe_id && installation.rank_state === "installed"));
+          const runningRecords = stateRecords.filter(record => (node.loaded ?? []).some(run => run.recipe_id === localRecipeId(record)));
+          const installedRecords = stateRecords.filter(record => !runningRecords.includes(record) && (node.installed ?? []).some(installation => installation.recipe_id === localRecipeId(record) && installation.rank_state === "installed"));
           const projectedState = sparkPlacementState(node, stateRecords, activeDetail);
           const group = activeDetail ? groupForNode(activeDetail, node.id) : undefined;
           const groupReady = Boolean(group?.node_ids.every(nodeId => fleet.nodes.some(item => item.id === nodeId && item.connection?.online_state === "online")));
@@ -584,7 +590,7 @@ export function LibraryWorkcell({
           return <article key={node.id} className={`library-spark-target state-${state}${dropActive ? " is-drop-active" : ""}${compatibilityPending ? " is-drop-pending" : ""}${(draggedRecipe || placementRecipe) && !compatible && !compatibilityPending ? " is-drop-incompatible" : ""}`} onDragEnter={event => { event.preventDefault(); setDropNodeId(node.id); }} onDragOver={event => { if (compatible) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }} onDragLeave={() => setDropNodeId(current => current === node.id ? "" : current)} onDrop={event => { event.preventDefault(); setDropNodeId(""); const record = draggedRecipe ?? placementRecipe; setDraggedRecipe(undefined); const trigger = event.currentTarget.querySelector<HTMLButtonElement>(".library-place-target"); if (record && compatible && trigger) void openPlacement(record, node, trigger, "drag-drop"); }}>
             <header><div><strong>{node.display_name || node.hostname}</strong><span>{node.hostname}</span></div><span className={`library-spark-state state-${state}`}>{stateLabel(state)}</span></header>
             <dl><div><dt>Connection</dt><dd>{node.connection?.online_state ?? "Unknown"}</dd></div><div><dt>Workloads</dt><dd>{(node.loaded ?? []).length} running · {(node.installed ?? []).length} installed</dd></div>{node.inventory && <div><dt>Disk free</dt><dd>{formatBytes(node.inventory.disk_free_bytes)}</dd></div>}</dl>
-            {(runningRecords.length > 0 || installedRecords.length > 0) && <div className="library-selected-locations" role="group" aria-label={`Selected content on ${node.display_name || node.hostname}`}>{runningRecords.map(record => { const run = (node.loaded ?? []).find(item => item.recipe_id === record.recipe?.recipe_id); return <p key={`run-${record.key}`}><strong>{run?.healthy === false ? "Running · attention" : "Running"}</strong><span>{record.title}</span></p>; })}{installedRecords.map(record => <p key={`installed-${record.key}`}><strong>Installed</strong><span>{record.title}</span></p>)}</div>}
+            {(runningRecords.length > 0 || installedRecords.length > 0) && <div className="library-selected-locations" role="group" aria-label={`Selected content on ${node.display_name || node.hostname}`}>{runningRecords.map(record => { const run = (node.loaded ?? []).find(item => item.recipe_id === localRecipeId(record)); return <p key={`run-${record.key}`}><strong>{run?.healthy === false ? "Running · attention" : "Running"}</strong><span>{record.title}</span></p>; })}{installedRecords.map(record => <p key={`installed-${record.key}`}><strong>Installed</strong><span>{record.title}</span></p>)}</div>}
             {atomicNodes.length > 1 && <p className="library-atomic-placement"><strong>Atomic {atomicNodes.length}-Spark placement</strong><span>{atomicNodes.map(nodeId => fleet.nodes.find(item => item.id === nodeId)?.display_name ?? nodeId).join(" + ")}</span></p>}
             {state === "withdrawn" && <p className="library-withdrawn-impact"><strong>Installed content is withdrawn upstream</strong><span>{activeSelectedRun ? "This content is running. Stop the complete run before reviewing removal." : "This exact local content stays pinned and cannot receive further catalog updates."}</span></p>}
             {(draggedRecipe || placementRecipe) && <button type="button" className="button secondary library-place-target" disabled={!compatible || placementLoading} onClick={event => { const record = draggedRecipe ?? placementRecipe; if (record) void openPlacement(record, node, event.currentTarget, event.detail === 0 ? "keyboard" : "button"); }}>{compatibilityPending ? "Checking compatibility…" : compatible ? `Review placement on ${node.display_name || node.hostname}` : `${state === "offline" ? "Offline" : "Incompatible"} for placement`}</button>}
