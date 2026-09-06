@@ -95,6 +95,7 @@ pub enum PodmanBuildDiagnostic {
     MemoryLimitExceeded,
     StorageDriverFailure,
     SystemdScopeFailure,
+    PackagePlatformIncompatible,
     NonzeroWithoutOutput,
     Unknown,
 }
@@ -110,6 +111,7 @@ impl fmt::Display for PodmanBuildDiagnostic {
             Self::MemoryLimitExceeded => "memory-limit-exceeded",
             Self::StorageDriverFailure => "storage-driver-failure",
             Self::SystemdScopeFailure => "systemd-scope-failure",
+            Self::PackagePlatformIncompatible => "package-platform-incompatible",
             Self::NonzeroWithoutOutput => "nonzero-without-output",
             Self::Unknown => "unclassified-podman-build-failure",
         })
@@ -785,9 +787,54 @@ fn podman_build_diagnostic(output: &crate::process::ProcessOutput) -> PodmanBuil
         || evidence.contains("failed with result")
     {
         PodmanBuildDiagnostic::SystemdScopeFailure
+    } else if [&output.stdout, &output.stderr]
+        .into_iter()
+        .any(|stream| pip_check_platform_failure(stream))
+    {
+        PodmanBuildDiagnostic::PackagePlatformIncompatible
     } else {
         PodmanBuildDiagnostic::Unknown
     }
+}
+
+fn pip_check_platform_failure(stream: &[u8]) -> bool {
+    // The ring's first retained line may be a suffix of an echoed command.
+    let complete = if let Some(tail) = stream.strip_prefix(crate::process::DIAGNOSTIC_TRUNCATED) {
+        let Some(newline) = tail.iter().position(|byte| *byte == b'\n') else {
+            return false;
+        };
+        &tail[newline + 1..]
+    } else {
+        stream
+    };
+    complete.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        std::str::from_utf8(line).is_ok_and(pip_check_platform_incompatible)
+    })
+}
+
+// Recognize pip check's complete diagnostic line, not a quoted command or
+// traceback containing it. Package/version text never leaves this classifier.
+fn pip_check_platform_incompatible(line: &str) -> bool {
+    let Some(package_version) = line.strip_suffix(" is not supported on this platform") else {
+        return false;
+    };
+    let Some((package, version)) = package_version.split_once(' ') else {
+        return false;
+    };
+    !package.is_empty()
+        && package.len() <= 128
+        && package.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && package.ends_with(|c: char| c.is_ascii_alphanumeric())
+        && package
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        && !version.is_empty()
+        && version.len() <= 128
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b".!+_-".contains(&c))
 }
 
 fn podman_import_process_error(error: ProcessError) -> RecipeBuildError {
@@ -1234,6 +1281,113 @@ mod tests {
             assert_eq!(error.failure_evidence()["diagnostic"], diagnostic);
             assert!(!error.failure_evidence().to_string().contains("private"));
             assert!(!error.failure_evidence().to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn pip_platform_failure_is_anchored_and_secret_free() {
+        let line = "nvidia-cusparselt-cu13 0.8.0 is not supported on this platform";
+        for (stdout, stderr) in [
+            (format!("{line}\n"), "".to_owned()),
+            ("".to_owned(), format!("{line}\r\n")),
+            (
+                format!("prior output\n{line}\n"),
+                "CalledProcessError: private-token /private/checks.py".to_owned(),
+            ),
+        ] {
+            let error = RecipeBuildError::ImageBuild {
+                diagnostic: podman_build_diagnostic(&ProcessOutput {
+                    success: false,
+                    stdout: stdout.into_bytes(),
+                    stderr: stderr.into_bytes(),
+                }),
+            };
+            assert_eq!(
+                error.failure_evidence(),
+                serde_json::json!({
+                    "stage": "image-build",
+                    "diagnostic": "package-platform-incompatible",
+                    "reason": "Podman recipe image build failed (package-platform-incompatible)",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn pip_platform_failure_rejects_echoes_and_malformed_lines() {
+        for line in [
+            "RUN echo 'nvidia-cusparselt-cu13 0.8.0 is not supported on this platform'",
+            "print(\"nvidia-cusparselt-cu13 0.8.0 is not supported on this platform\")",
+            "CalledProcessError: nvidia-cusparselt-cu13 0.8.0 is not supported on this platform",
+            " nvidia-cusparselt-cu13 0.8.0 is not supported on this platform",
+            "nvidia-cusparselt-cu13 0.8.0 is not supported on this platform (echo)",
+            "/private/package 0.8.0 is not supported on this platform",
+            "package secret=value is not supported on this platform",
+            "package 0.8.0\n is not supported on this platform",
+            "\u{1b}[31mpackage 0.8.0 is not supported on this platform",
+        ] {
+            let diagnostic = podman_build_diagnostic(&ProcessOutput {
+                success: false,
+                stdout: line.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            });
+            assert_eq!(
+                diagnostic.to_string(),
+                "unclassified-podman-build-failure",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn pip_platform_failure_requires_a_complete_valid_retained_line() {
+        let line = b"nvidia-cusparselt-cu13 0.8.0 is not supported on this platform\n";
+        let mut uncertain = crate::process::DIAGNOSTIC_TRUNCATED.to_vec();
+        uncertain.extend_from_slice(line);
+        let mut complete = uncertain.clone();
+        complete.extend_from_slice(line);
+        let mut invalid = vec![0xff];
+        invalid.extend_from_slice(line);
+        let mut recovered = invalid.clone();
+        recovered.extend_from_slice(line);
+        for (stdout, stderr, expected) in [
+            (uncertain.clone(), Vec::new(), false),
+            (Vec::new(), uncertain, false),
+            (complete, Vec::new(), true),
+            (invalid, Vec::new(), false),
+            (recovered, Vec::new(), true),
+        ] {
+            let diagnostic = podman_build_diagnostic(&ProcessOutput {
+                success: false,
+                stdout,
+                stderr,
+            });
+            assert_eq!(
+                diagnostic.to_string() == "package-platform-incompatible",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pip_platform_failure_preserves_existing_precedence() {
+        for (existing, expected) in [
+            ("no space left on device", "temporary-storage-exhausted"),
+            ("permission denied", "permission-denied"),
+            ("out of memory", "memory-limit-exceeded"),
+            ("fuse-overlayfs", "storage-driver-failure"),
+            (
+                "Failed to start transient scope unit",
+                "systemd-scope-failure",
+            ),
+        ] {
+            let diagnostic = podman_build_diagnostic(&ProcessOutput {
+                success: false,
+                stdout: b"nvidia-cusparselt-cu13 0.8.0 is not supported on this platform\n"
+                    .to_vec(),
+                stderr: existing.as_bytes().to_vec(),
+            });
+            assert_eq!(diagnostic.to_string(), expected);
         }
     }
 

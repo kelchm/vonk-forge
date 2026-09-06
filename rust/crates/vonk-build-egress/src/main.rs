@@ -20,6 +20,8 @@ const MAX_RESOLVED_ADDRESSES: usize = 16;
 const MAX_TUNNEL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_PROBE_STATUS_BYTES: usize = 256;
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -33,24 +35,14 @@ fn main() -> ExitCode {
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
     if arguments == ["--probe"] {
-        let mut stream = TcpStream::connect_timeout(
+        let stream = TcpStream::connect_timeout(
             &"127.0.0.1:18080"
                 .parse()
                 .map_err(|_| "probe address is invalid")?,
-            Duration::from_secs(2),
+            PROBE_TIMEOUT,
         )
         .map_err(|_| "proxy is unavailable")?;
-        stream
-            .write_all(b"GET http://proxy.invalid/ HTTP/1.1\r\nHost: proxy.invalid\r\n\r\n")
-            .map_err(|_| "proxy probe write failed")?;
-        let mut response = [0_u8; 16];
-        let read = stream
-            .read(&mut response)
-            .map_err(|_| "proxy probe read failed")?;
-        if read < 12 || !response.starts_with(b"HTTP/1.1 403") {
-            return Err("proxy probe response is invalid".to_owned());
-        }
-        return Ok(());
+        return probe_stream(stream, PROBE_TIMEOUT);
     }
     let mut hosts = BTreeSet::new();
     let mut index = 0;
@@ -68,6 +60,53 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
         return Err("declared host allowlist is invalid".to_owned());
     }
     serve(Arc::new(hosts)).map_err(|_| "proxy listener failed".to_owned())
+}
+
+fn probe_stream(mut stream: TcpStream, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| "proxy probe timeout setup failed")?;
+    stream
+        .write_all(b"GET http://proxy.invalid/ HTTP/1.1\r\nHost: proxy.invalid\r\n\r\n")
+        .map_err(|_| "proxy probe write failed")?;
+    read_probe_status(|buffer| {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|value| !value.is_zero())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+        stream.set_read_timeout(Some(remaining))?;
+        stream.read(buffer)
+    })
+}
+
+fn read_probe_status(mut read: impl FnMut(&mut [u8]) -> io::Result<usize>) -> Result<(), String> {
+    // TCP reads do not preserve writes: accept a fragmented, complete status line,
+    // while bounding both its size and (in probe_stream) the total I/O deadline.
+    let mut response = Vec::with_capacity(MAX_PROBE_STATUS_BYTES);
+    loop {
+        let mut buffer = [0_u8; 64];
+        let count = read(&mut buffer).map_err(|_| "proxy probe read failed")?;
+        if count == 0 {
+            return Err("proxy probe response ended before the status line".to_owned());
+        }
+        for byte in &buffer[..count] {
+            response.push(*byte);
+            if response.ends_with(b"\r\n") {
+                let status = &response[..response.len() - 2];
+                return if status.starts_with(b"HTTP/1.1 403 ")
+                    && status.iter().all(|byte| (b' '..=b'~').contains(byte))
+                {
+                    Ok(())
+                } else {
+                    Err("proxy probe response is invalid".to_owned())
+                };
+            }
+            if response.len() >= MAX_PROBE_STATUS_BYTES {
+                return Err("proxy probe status line is too long".to_owned());
+            }
+        }
+    }
 }
 
 fn serve(hosts: Arc<BTreeSet<String>>) -> io::Result<()> {
@@ -483,6 +522,71 @@ fn reject(mut stream: TcpStream, status: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_accepts_a_fragmented_complete_denial_status_line() {
+        // The original one-read probe rejected the first nine-byte fragment.
+        let mut fragments = [
+            b"HTTP/1.1 ".as_slice(),
+            b"4".as_slice(),
+            b"03 Forbidden\r".as_slice(),
+            b"\nContent-Length: 0\r\n\r\n".as_slice(),
+        ]
+        .into_iter();
+        assert!(
+            read_probe_status(|buffer| {
+                let fragment = fragments.next().unwrap_or_default();
+                buffer[..fragment.len()].copy_from_slice(fragment);
+                Ok(fragment.len())
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn probe_rejects_wrong_codes_malformed_lines_and_premature_eof() {
+        for value in [
+            b"HTTP/1.1 200 OK\r\n".as_slice(),
+            b"HTTP/1.1 4030 Invalid\r\n".as_slice(),
+            b"HTTP/1.1 403 Forbidden\n".as_slice(),
+            b"HTTP/1.1 403 For\0bidden\r\n".as_slice(),
+            b"HTTP/1.1 403 Forbidden\r".as_slice(),
+            b"".as_slice(),
+        ] {
+            let mut source = value;
+            assert!(read_probe_status(|buffer| source.read(buffer)).is_err());
+        }
+        let mut bytes = 0;
+        assert!(
+            read_probe_status(|buffer| {
+                buffer.fill(b'x');
+                bytes += buffer.len();
+                Ok(buffer.len())
+            })
+            .unwrap_err()
+            .contains("too long")
+        );
+        assert_eq!(bytes, MAX_PROBE_STATUS_BYTES);
+    }
+
+    #[test]
+    fn probe_deadline_is_not_extended_by_slow_partial_status_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let peer = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            for byte in b"HTTP/1.1 403 Forbidden\r\n" {
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let started = Instant::now();
+        assert!(probe_stream(stream, Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        peer.join().unwrap();
+    }
 
     #[test]
     fn rejects_private_reserved_and_metadata_destinations() {
