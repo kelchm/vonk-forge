@@ -8,8 +8,10 @@ import {libraryRoute, modelVersionKey} from "../lib/library-route";
 import type {LibraryRoute} from "../lib/library-route";
 import "./library.css";
 
-const LIBRARY_MODEL_WINDOW = 40;
-const LIBRARY_RECIPE_WINDOW = 50;
+// Retain at least one complete API page (at most 100 recipe rows).
+// A smaller model window discards valid local authority before search can use it.
+const LIBRARY_MODEL_WINDOW = 100;
+const LIBRARY_RECIPE_WINDOW = 100;
 const LIBRARY_REPOSITORY_REFRESH_MS = 60_000;
 
 type RouteParent =

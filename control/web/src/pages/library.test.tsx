@@ -2,7 +2,7 @@ import {render, screen, waitFor, within} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type {ControlApi, LibrarySnapshot, PublicRecipe} from "../api/types";
 import {App} from "../app";
-import {librarySnapshot} from "../test-fixtures/library";
+import {libraryRecipeSummary, librarySnapshot, minimalLibraryDetail} from "../test-fixtures/library";
 
 function recipe(overrides: Partial<PublicRecipe> = {}): PublicRecipe {
   return {
@@ -13,6 +13,76 @@ function recipe(overrides: Partial<PublicRecipe> = {}): PublicRecipe {
 }
 
 const emptySnapshot: LibrarySnapshot = {...librarySnapshot, models: [], unlinked_recipes: []};
+
+function largeLibrary(modelCount: number, start = 0): LibrarySnapshot {
+  return {...emptySnapshot, models: Array.from({length: modelCount}, (_, index) => {
+    const id = start + index;
+    return {model: {...librarySnapshot.models[0]!.model, slug: `model-${id}`}, page_local: true, recipes: [libraryRecipeSummary({recipe_id: `recipe-${id}`, slug: `recipe-${id}`, title: id === 0 ? "Qwen evaluation" : `Recipe ${id}`})]};
+  })};
+}
+
+function publicRows(snapshot: LibrarySnapshot): PublicRecipe[] {
+  return snapshot.models.flatMap(model => model.recipes.map(item => recipe({
+    slug: item.slug, title: item.title, uri: `vonk://catalog/vonk-forge/${item.slug}@sha256:${"b".repeat(64)}`,
+    local: {status: "current", recipe_id: item.recipe_id, revision_number: 3, content_sha256: "a".repeat(64), release_version: "1.0.0"},
+  })));
+}
+
+test("retains all local authority from a complete API page larger than forty models", async () => {
+  history.replaceState(null, "", "/library");
+  const snapshot = largeLibrary(73);
+  snapshot.models[0]!.recipes.push(...Array.from({length: 11}, (_, index) => libraryRecipeSummary({recipe_id: `extra-${index}`, slug: `extra-${index}`, title: `Extra ${index}`})));
+  const catalog = publicRows(snapshot);
+  snapshot.models[0]!.recipes.push(libraryRecipeSummary({recipe_id: "custom-eval", slug: "custom-eval", title: "Qwen custom evaluation"}));
+  const api = {librarySnapshot: async () => snapshot, listPublicRecipes: async () => ({repository: "repo", commit: "c".repeat(40), recipes: catalog})} as unknown as ControlApi;
+  const user = userEvent.setup();
+  render(<App api={api}/>);
+
+  expect(await screen.findByRole("group", {name: "73 model versions"})).toBeVisible();
+  expect(screen.getByRole("group", {name: "85 recipes"})).toBeVisible();
+  expect(screen.getAllByRole("button", {name: "Place on Spark"})).toHaveLength(85);
+  expect(screen.queryByRole("button", {name: "Syncing…"})).not.toBeInTheDocument();
+  await user.type(screen.getByRole("searchbox", {name: "Search Library"}), "Qwen");
+  expect(screen.getByRole("link", {name: "Qwen evaluation"})).toBeVisible();
+  expect(screen.getByRole("link", {name: "Qwen custom evaluation"})).toBeVisible();
+});
+
+test("keeps later pages bounded while imported evicted rows can open exact details", async () => {
+  history.replaceState(null, "", "/library");
+  const first = {...largeLibrary(100), next_cursor: "next"};
+  const next = largeLibrary(25, 100);
+  const catalog = [...publicRows(first), ...publicRows(next), recipe()];
+  const librarySnapshotApi = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(next);
+  const detail = {...minimalLibraryDetail, recipe: {...minimalLibraryDetail.recipe, recipe_id: "recipe-0", title: "Qwen evaluation"}};
+  const libraryRecipe = vi.fn().mockResolvedValue(detail);
+  const api = {librarySnapshot: librarySnapshotApi, libraryRecipe, listPublicRecipes: async () => ({repository: "repo", commit: "c".repeat(40), recipes: catalog})} as unknown as ControlApi;
+  const user = userEvent.setup();
+  render(<App api={api}/>);
+  await user.click(await screen.findByRole("button", {name: "Load more Library recipes"}));
+  await waitFor(() => expect(librarySnapshotApi).toHaveBeenCalledTimes(2));
+  expect(await screen.findByRole("status", {name: "Bounded Library window"})).toHaveTextContent("No more server pages remain");
+  expect(screen.getByRole("group", {name: "100 model versions"})).toBeVisible();
+  const row = screen.getByRole("row", {name: /Qwen evaluation/});
+  expect(within(row).queryByRole("button", {name: "Syncing…"})).not.toBeInTheDocument();
+  expect(screen.getByRole("button", {name: "Syncing…"})).toBeDisabled();
+  await user.click(within(row).getByRole("link", {name: "Open recipe"}));
+  expect(await screen.findByRole("region", {name: "Recipe detail"})).toHaveTextContent("Qwen evaluation");
+  expect(libraryRecipe).toHaveBeenCalledWith("recipe-0", expect.any(AbortSignal));
+});
+
+test("keeps the selected recipe pinned as later pages evict older models", async () => {
+  history.replaceState(null, "", "/library/recipes/recipe-0");
+  const first = {...largeLibrary(100), next_cursor: "next"};
+  const next = largeLibrary(25, 100);
+  const api = {librarySnapshot: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(next), libraryRecipe: async () => ({...minimalLibraryDetail, recipe: {...minimalLibraryDetail.recipe, recipe_id: "recipe-0", title: "Qwen evaluation"}}), listPublicRecipes: async () => ({repository: "repo", commit: "c".repeat(40), recipes: [...publicRows(first), ...publicRows(next)]})} as unknown as ControlApi;
+  const user = userEvent.setup();
+  render(<App api={api}/>);
+  await user.click(await screen.findByRole("button", {name: "Load more Library recipes"}));
+  expect(await screen.findByRole("status", {name: "Bounded Library window"})).toBeVisible();
+  expect(screen.getByRole("group", {name: "100 model versions"})).toBeVisible();
+  expect(screen.getByRole("button", {name: "Place on Spark"})).toBeEnabled();
+  expect(screen.getByRole("region", {name: "Recipe detail"})).toHaveTextContent("Qwen evaluation");
+});
 
 afterEach(() => { history.replaceState(null, "", "/"); vi.restoreAllMocks(); });
 
