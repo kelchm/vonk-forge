@@ -2990,3 +2990,85 @@ fn post_stop_marker_is_retained_until_host_hook_success_is_finalized() {
             .exists()
     );
 }
+
+#[test]
+fn observation_snapshot_survives_atomic_stop_and_job_cleanup_without_losing_another_run() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct Ready;
+    impl ProcessRunner for Ready {
+        fn run(
+            &self,
+            program: Program,
+            _: &[String],
+            _: Duration,
+        ) -> Result<ProcessOutput, ProcessError> {
+            assert_eq!(program, Program::Curl);
+            Ok(ProcessOutput {
+                success: true,
+                stdout: b"200".to_vec(),
+                stderr: vec![],
+            })
+        }
+    }
+    let root = tempdir().unwrap();
+    let active = "45ea6921-50c9-4971-be2a-4cd04ce05069";
+    let stopping = "55ea6921-50c9-4971-be2a-4cd04ce05069";
+    let job = "65ea6921-50c9-4971-be2a-4cd04ce05069";
+    let installation = "cb555393-764b-4eb6-8f15-b416d289428f";
+    for run in [active, stopping] {
+        write_managed_run(root.path(), run, installation, 8000);
+    }
+    let marker = root
+        .path()
+        .join("run-metadata")
+        .join(stopping)
+        .join("lifecycle.json");
+    let record = fs::read(&marker).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let writer_done = done.clone();
+    let writer_root = root.path().to_path_buf();
+    let writer = thread::spawn(move || {
+        let runtime = OciRuntime {
+            runner: &Ready,
+            data_root: &writer_root,
+            huggingface_curl_config: None,
+        };
+        for _ in 0..200 {
+            runtime.complete_stop(stopping).unwrap();
+            fs::create_dir_all(writer_root.join("runs").join(job)).unwrap();
+            runtime.cleanup_job_scope(job).unwrap();
+            let temporary = marker.with_extension("pending");
+            fs::write(&temporary, &record).unwrap();
+            // Match prepare_start's complete-file atomic replacement.
+            fs::rename(temporary, &marker).unwrap();
+        }
+        runtime.complete_stop(stopping).unwrap();
+        writer_done.store(true, Ordering::SeqCst);
+    });
+    let runtime = OciRuntime {
+        runner: &Ready,
+        data_root: root.path(),
+        huggingface_curl_config: None,
+    };
+    let mut cycles = 0;
+    while !done.load(Ordering::SeqCst) || cycles < 200 {
+        let snapshot = runtime.recipe_run_observations().unwrap();
+        assert!(snapshot.iter().any(|run| run.run_id == active && run.ready));
+        assert!(
+            snapshot
+                .iter()
+                .all(|run| run.run_id == active || run.run_id == stopping)
+        );
+        // Neither historical legacy lifecycle nor a transient job directory
+        // can become an exact signed inspection assignment.
+        assert!(runtime.recipe_run_inspection_plans().unwrap().is_empty());
+        cycles += 1;
+    }
+    writer.join().unwrap();
+    let snapshot = runtime.recipe_run_observations().unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].run_id, active);
+}
