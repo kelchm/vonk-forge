@@ -2592,6 +2592,39 @@ mod tests {
     }
 
     #[test]
+    fn package_platform_failure_normalization_exposes_only_constant_evidence() {
+        use crate::recipe_builder::{PodmanBuildDiagnostic, RecipeBuildError};
+        let mut build_claim = claim();
+        build_claim.operation = "recipe.build.v1".to_owned();
+        let mut evidence = RecipeBuildError::ImageBuild {
+            diagnostic: PodmanBuildDiagnostic::PackagePlatformIncompatible,
+        }
+        .failure_evidence();
+        evidence["stdout"] =
+            json!("nvidia-cusparselt-cu13 0.8.0 is not supported on this platform");
+        evidence["stderr"] = json!("private-token /private/checks.py");
+        evidence["path"] = json!("/private/checks.py");
+        let result = normalize_execution_result(
+            &build_claim,
+            ExecutionResult {
+                state: "failed",
+                body: evidence,
+            },
+        );
+        assert_eq!(result.state, "failed");
+        assert_eq!(
+            result.body,
+            json!({
+                "error_code": "recipe_build_failed",
+                "status": "failed",
+                "stage": "image-build",
+                "diagnostic": "package-platform-incompatible",
+                "reason": "Podman recipe image build failed (package-platform-incompatible)",
+            })
+        );
+    }
+
+    #[test]
     fn agent_upgrade_failure_preserves_only_bounded_helper_diagnostics() {
         let mut upgrade_claim = claim();
         upgrade_claim.operation = "agent.upgrade.v1".to_owned();
