@@ -1918,6 +1918,8 @@ pub enum LoopError {
     State(#[from] StateError),
     #[error("agent heartbeat task failed")]
     HeartbeatTask,
+    #[error("agent heartbeat lease expired before renewal")]
+    HeartbeatLeaseExpired,
     #[error("agent readiness publication failed: {0}")]
     Readiness(String),
 }
@@ -2166,9 +2168,12 @@ async fn run_heartbeats<C: LoopClient>(
     let mut deadline = claim.deadline;
     let mut cancellation_observed = false;
     loop {
+        let remaining = (deadline - Utc::now().fixed_offset())
+            .to_std()
+            .map_err(|_| LoopError::HeartbeatLeaseExpired)?;
         tokio::select! {
             _ = &mut stop => return Ok(cancellation_observed),
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(interval.min(remaining)) => {}
         }
         let progress = AgentProgress {
             attempt: claim.attempt,
@@ -2180,7 +2185,24 @@ async fn run_heartbeats<C: LoopClient>(
             progress: json!({"phase": "executing"}),
             schema_version: claim.schema_version,
         };
-        let directive = client.heartbeat(&progress).await?;
+        let remaining = (deadline - Utc::now().fixed_offset())
+            .to_std()
+            .map_err(|_| LoopError::HeartbeatLeaseExpired)?;
+        let response = tokio::select! {
+            _ = &mut stop => return Ok(cancellation_observed),
+            response = tokio::time::timeout(remaining, client.heartbeat(&progress)) => response,
+        };
+        let directive = match response {
+            Ok(Ok(directive)) => directive,
+            Ok(Err(error)) if error.retryable() => {
+                // A dropped connection or temporary controller rejection does
+                // not revoke the last confirmed lease, and cannot extend it.
+                // Retry on the normal cadence using the unchanged exact fence.
+                continue;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(LoopError::HeartbeatLeaseExpired),
+        };
         state.apply_heartbeat(&progress, &directive)?;
         lease_deadline.send_replace(directive.deadline);
         deadline = directive.deadline;
@@ -2215,7 +2237,7 @@ mod tests {
         net::TcpListener,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
@@ -2533,6 +2555,7 @@ mod tests {
         cancel_requested: bool,
         claim: Arc<Mutex<Option<AgentClaim>>>,
         fail_heartbeat: bool,
+        retryable_heartbeats: Arc<AtomicUsize>,
         heartbeats: Arc<Mutex<Vec<AgentProgress>>>,
         results: Arc<Mutex<Vec<AgentResult>>>,
     }
@@ -2551,6 +2574,15 @@ mod tests {
         async fn heartbeat(&self, progress: &AgentProgress) -> Result<AgentDirective, ClientError> {
             self.heartbeats.lock().unwrap().push(progress.clone());
             if self.fail_heartbeat {
+                return Err(ClientError::Authentication);
+            }
+            if self
+                .retryable_heartbeats
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
                 return Err(ClientError::Retryable);
             }
             Ok(AgentDirective {
@@ -2683,6 +2715,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2720,6 +2753,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(original.clone()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: heartbeats.clone(),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2757,13 +2791,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn heartbeat_failure_leaves_a_durable_terminal_result_not_a_busy_attempt() {
+    async fn heartbeat_authentication_failure_leaves_a_durable_terminal_result_not_a_busy_attempt()
+    {
         let directory = tempdir().unwrap();
         let heartbeats = Arc::new(Mutex::new(Vec::new()));
         let client = RecordingClient {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: true,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: heartbeats.clone(),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2791,9 +2827,333 @@ mod tests {
 
         assert!(matches!(
             error,
-            super::LoopError::Client(ClientError::Retryable)
+            super::LoopError::Client(ClientError::Authentication)
         ));
         assert_eq!(state.pending_results().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_transient_failures_recover_without_minting_a_deadline() {
+        let directory = tempdir().unwrap();
+        let original = claim();
+        let heartbeats = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingClient {
+            cancel_requested: false,
+            claim: Arc::new(Mutex::new(Some(original.clone()))),
+            fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(2)),
+            heartbeats: heartbeats.clone(),
+            results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let executor = HeartbeatGatedExecutor {
+            heartbeats,
+            minimum: 4,
+            observed_deadline: Arc::new(Mutex::new(None)),
+        };
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        run_once_with_heartbeat_interval(
+            &client,
+            &mut state,
+            &executor,
+            RunOncePolicy {
+                capabilities: &["recipe.install"],
+                wait_seconds: 0,
+                runtime_identity: None,
+                heartbeat_interval: Duration::from_millis(10),
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        let sent = client.heartbeats.lock().unwrap();
+        assert!(sent.len() >= 4);
+        for progress in &sent[..3] {
+            assert_eq!(progress.deadline, original.deadline);
+            assert_eq!(progress.fence, original.fence);
+        }
+        assert!(sent[3].deadline > original.deadline);
+        assert_eq!(client.results.lock().unwrap().len(), 1);
+        assert!(state.pending_results().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_retries_stop_at_the_last_authorized_deadline() {
+        let directory = tempdir().unwrap();
+        let mut original = claim();
+        let heartbeats = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingClient {
+            cancel_requested: false,
+            claim: Arc::new(Mutex::new(None)),
+            fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(usize::MAX)),
+            heartbeats: heartbeats.clone(),
+            results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        // Database initialization is outside the short test lease. Use the same
+        // captured time for admission so slow setup cannot pre-expire the claim.
+        let admitted_at = Utc::now();
+        original.deadline = (admitted_at + ChronoDuration::milliseconds(500)).fixed_offset();
+        state.begin(&original, admitted_at).unwrap();
+        let (_stop, stopped) = tokio::sync::oneshot::channel();
+        let (lease, deadline) = tokio::sync::watch::channel(original.deadline);
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::run_heartbeats(
+                client,
+                state,
+                original.clone(),
+                lease,
+                cancel,
+                stopped,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("heartbeat retries outlived the confirmed lease")
+        .unwrap_err();
+        assert!(matches!(error, super::LoopError::HeartbeatLeaseExpired));
+        assert_eq!(*deadline.borrow(), original.deadline);
+        assert!(!*cancellation.borrow());
+        assert!(
+            heartbeats
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|progress| progress.deadline == original.deadline)
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum HeartbeatFault {
+        Pending,
+        Protocol,
+    }
+
+    #[derive(Clone)]
+    struct FaultHeartbeatClient {
+        fault: HeartbeatFault,
+        entered: Arc<tokio::sync::Notify>,
+        request_dropped: Arc<AtomicBool>,
+        requests: Arc<AtomicUsize>,
+    }
+
+    struct HeartbeatRequestGuard(Arc<AtomicBool>);
+
+    impl Drop for HeartbeatRequestGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl LoopClient for FaultHeartbeatClient {
+        async fn claim(
+            &self,
+            _capabilities: &[&str],
+            _wait_seconds: u64,
+            _runtime_identity: Option<&AgentRuntimeIdentity>,
+        ) -> Result<Option<AgentClaim>, ClientError> {
+            panic!("direct heartbeat fixture must not claim another operation")
+        }
+
+        async fn heartbeat(
+            &self,
+            _progress: &AgentProgress,
+        ) -> Result<AgentDirective, ClientError> {
+            let _request = HeartbeatRequestGuard(Arc::clone(&self.request_dropped));
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            match self.fault {
+                HeartbeatFault::Pending => std::future::pending().await,
+                HeartbeatFault::Protocol => Err(ClientError::Protocol),
+            }
+        }
+
+        async fn submit_result(&self, _result: &AgentResult) -> Result<(), ClientError> {
+            panic!("direct heartbeat fixture must not submit an operation result")
+        }
+    }
+
+    fn fault_heartbeat_client(fault: HeartbeatFault) -> FaultHeartbeatClient {
+        FaultHeartbeatClient {
+            fault,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            request_dropped: Arc::new(AtomicBool::new(false)),
+            requests: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_hanging_request_is_dropped_at_the_confirmed_deadline() {
+        let directory = tempdir().unwrap();
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        let mut original = claim();
+        let admitted_at = Utc::now();
+        original.deadline = (admitted_at + ChronoDuration::seconds(2)).fixed_offset();
+        state.begin(&original, admitted_at).unwrap();
+        let client = fault_heartbeat_client(HeartbeatFault::Pending);
+        let (_stop, stopped) = tokio::sync::oneshot::channel();
+        let (lease, deadline) = tokio::sync::watch::channel(original.deadline);
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::run_heartbeats(
+                client.clone(),
+                state,
+                original.clone(),
+                lease,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("pending heartbeat outlived its confirmed lease")
+        .unwrap_err();
+        assert!(matches!(error, super::LoopError::HeartbeatLeaseExpired));
+        assert_eq!(client.requests.load(Ordering::SeqCst), 1);
+        assert!(client.request_dropped.load(Ordering::SeqCst));
+        assert_eq!(*deadline.borrow(), original.deadline);
+        assert!(!*cancellation.borrow());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_stop_drops_an_in_flight_request_without_renewing() {
+        let directory = tempdir().unwrap();
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        let original = claim();
+        state.begin(&original, Utc::now()).unwrap();
+        let client = fault_heartbeat_client(HeartbeatFault::Pending);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (lease, deadline) = tokio::sync::watch::channel(original.deadline);
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(super::run_heartbeats(
+            client.clone(),
+            state,
+            original.clone(),
+            lease,
+            cancel,
+            stopped,
+            Duration::from_millis(1),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), client.entered.notified())
+            .await
+            .expect("heartbeat did not enter the request");
+        stop.send(()).unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stop did not interrupt the request")
+            .unwrap()
+            .unwrap();
+        assert!(!cancelled);
+        assert_eq!(client.requests.load(Ordering::SeqCst), 1);
+        assert!(client.request_dropped.load(Ordering::SeqCst));
+        assert_eq!(*deadline.borrow(), original.deadline);
+        assert!(!*cancellation.borrow());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_protocol_failure_is_terminal_without_retry_or_renewal() {
+        let directory = tempdir().unwrap();
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        let original = claim();
+        state.begin(&original, Utc::now()).unwrap();
+        let client = fault_heartbeat_client(HeartbeatFault::Protocol);
+        let (_stop, stopped) = tokio::sync::oneshot::channel();
+        let (lease, deadline) = tokio::sync::watch::channel(original.deadline);
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::run_heartbeats(
+                client.clone(),
+                state,
+                original.clone(),
+                lease,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("protocol failure was retried")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::LoopError::Client(ClientError::Protocol)
+        ));
+        assert_eq!(client.requests.load(Ordering::SeqCst), 1);
+        assert!(client.request_dropped.load(Ordering::SeqCst));
+        assert_eq!(*deadline.borrow(), original.deadline);
+        assert!(!*cancellation.borrow());
+    }
+
+    struct LeaseBoundedExecutor;
+
+    #[async_trait(?Send)]
+    impl Executor for LeaseBoundedExecutor {
+        async fn execute(
+            &self,
+            _claim: &AgentClaim,
+            lease_deadline: tokio::sync::watch::Receiver<DateTime<FixedOffset>>,
+            _cancellation: tokio::sync::watch::Receiver<bool>,
+        ) -> ExecutionResult {
+            let remaining = (*lease_deadline.borrow() - Utc::now().fixed_offset())
+                .to_std()
+                .unwrap_or_default();
+            tokio::time::sleep(remaining + Duration::from_millis(20)).await;
+            ExecutionResult {
+                state: "failed",
+                body: json!({"reason": "operation stopped at its confirmed lease"}),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_lease_expiry_preserves_a_durable_result_before_propagating() {
+        let directory = tempdir().unwrap();
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        let mut original = claim();
+        original.deadline = (Utc::now() + ChronoDuration::seconds(1)).fixed_offset();
+        let client = RecordingClient {
+            cancel_requested: false,
+            claim: Arc::new(Mutex::new(Some(original.clone()))),
+            fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(usize::MAX)),
+            heartbeats: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_once_with_heartbeat_interval(
+                &client,
+                &mut state,
+                &LeaseBoundedExecutor,
+                RunOncePolicy {
+                    capabilities: &["recipe.install"],
+                    wait_seconds: 0,
+                    runtime_identity: None,
+                    heartbeat_interval: Duration::from_millis(10),
+                },
+                || Ok(()),
+            ),
+        )
+        .await
+        .expect("expired operation did not reach a durable boundary")
+        .unwrap_err();
+        assert!(matches!(error, super::LoopError::HeartbeatLeaseExpired));
+        assert!(client.results.lock().unwrap().is_empty());
+        drop(state);
+        let reopened = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        // pending_results selects only completed operations: expiry left a
+        // durable terminal result, not a running/busy attempt after restart.
+        let pending = reopened.pending_results().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, "failed");
+        assert_eq!(pending[0].deadline, original.deadline);
+        assert_eq!(pending[0].fence, original.fence);
+        assert_eq!(pending[0].result["error_code"], "recipe_install_failed");
     }
 
     #[tokio::test]
@@ -2803,6 +3163,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2956,6 +3317,7 @@ mod tests {
             cancel_requested: true,
             claim: Arc::new(Mutex::new(Some(job_claim))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
