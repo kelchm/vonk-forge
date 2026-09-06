@@ -333,6 +333,7 @@ class HostRuntimeAuthorityService:
         received_at: datetime,
         signed_grant: Mapping[str, object],
         helper_receipt: Mapping[str, object],
+        allow_stopped: bool = False,
     ) -> tuple[str, bool, str]:
         """Verify and consume the exact grant echoed by an observation result."""
 
@@ -343,6 +344,7 @@ class HostRuntimeAuthorityService:
             certificate_serial=certificate_serial,
             identity=identity,
             now=now,
+            allow_stopped=allow_stopped,
         )
         try:
             grant = SignedHostHelperGrant.parse(signed_grant)
@@ -437,6 +439,7 @@ class HostRuntimeAuthorityService:
         certificate_serial: str,
         identity: Mapping[str, object],
         now: datetime,
+        allow_stopped: bool = False,
     ) -> str:
         expected_fields = {
             "schema_version",
@@ -482,8 +485,10 @@ class HostRuntimeAuthorityService:
             or run_node is None
             or node is None
             or certificate is None
-            or run.state != "running"
-            or run_node.state != "running"
+            or not (
+                (run.state == "running" and run_node.state == "running")
+                or (allow_stopped and run.state in {"stopping", "stopped"})
+            )
             or run.plan.get("observation_schema_version") != 2
             or installation.state != "installed"
             or revision.content_sha256 is None
