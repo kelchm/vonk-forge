@@ -966,7 +966,10 @@ def test_freshness_boundaries_keep_telemetry_agent_and_inventory_independent() -
     ]
 
 
-def test_installed_and_loaded_groups_require_every_exact_current_rank() -> None:
+@pytest.mark.parametrize("reservation_bytes", [100, 74_387_433_571])
+def test_installed_and_loaded_groups_require_every_exact_current_rank(
+    reservation_bytes,
+) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
@@ -1123,7 +1126,7 @@ def test_installed_and_loaded_groups_require_every_exact_current_rank() -> None:
                     rank=0,
                     role="entrypoint",
                     state="installed",
-                    required_bytes=100,
+                    required_bytes=reservation_bytes,
                     installed_bytes=100,
                     updated_at=NOW,
                 ),
@@ -1134,7 +1137,7 @@ def test_installed_and_loaded_groups_require_every_exact_current_rank() -> None:
                     rank=1,
                     role="worker",
                     state="installed",
-                    required_bytes=100,
+                    required_bytes=reservation_bytes,
                     installed_bytes=100,
                     updated_at=NOW,
                 ),
@@ -1145,7 +1148,7 @@ def test_installed_and_loaded_groups_require_every_exact_current_rank() -> None:
                     rank=0,
                     role="entrypoint",
                     state="installed",
-                    required_bytes=100,
+                    required_bytes=reservation_bytes,
                     installed_bytes=100,
                     updated_at=NOW,
                 ),

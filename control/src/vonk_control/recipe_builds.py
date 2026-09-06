@@ -168,14 +168,9 @@ class RecipeBuildService:
             context = build.get("context") if isinstance(build, dict) else None
             source_sha256 = context.get("sha256") if isinstance(context, dict) else None
             public_network = _public_build_network(build)
-            if (
-                public_network
-                and "recipe.build.egress-proxy.v1" not in node.capabilities
-            ):
-                raise RecipeBuildError(
-                    "build.network_capability_missing",
-                    "builder does not advertise the hostname-aware build egress boundary",
-                )
+            # Claim capabilities name operations, whereas the egress boundary
+            # is host-probed inventory evidence. Check that fresh evidence below;
+            # a routine job claim legitimately omits the inventory-only flag.
             assert node.binary_digest is not None
             builder_binary_digest = node.binary_digest
             if not isinstance(source_sha256, str):

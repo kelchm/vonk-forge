@@ -260,7 +260,7 @@ class FileSupervisorAcknowledger:
         path: Path,
         *,
         clock: Callable[[], datetime],
-        timeout_seconds: float = 30,
+        timeout_seconds: float = 120,
         maximum_ack_age_seconds: float = 5,
         poll_seconds: float = 0.1,
         monotonic: Callable[[], float] = time.monotonic,
@@ -282,6 +282,8 @@ class FileSupervisorAcknowledger:
         self._sleep = sleep
 
     def __call__(self, marker: ActivationMarker) -> None:
+        # Match the supervisor's startup budget. The evidence lease below is
+        # still authoritative and can end this wait earlier.
         deadline = self._monotonic() + self._timeout_seconds
         expires = _parse_time(marker.expires_at, "expiry timestamp")
         while True:

@@ -1091,3 +1091,89 @@ def _recipe_owner_id(session) -> str:
     owner = session.get(RoutePublicationOwner, 1)
     assert owner is not None and owner.reconciliation_id is not None
     return owner.reconciliation_id
+
+
+@pytest.mark.parametrize("after_failure", ["healthy", "stale", "stopped"])
+def test_initial_ack_failure_retries_with_current_authority_after_backoff(
+    tmp_path, after_failure
+):
+    clock = MutableClock(NOW)
+    base, _, _, run_id = setup(tmp_path / "database", clock=clock)
+    service = atomic_service(base, tmp_path / "live", clock)
+    runtime = service._publisher._publisher
+    acknowledged = []
+
+    def failed_ack(marker):
+        raise RuntimeError("supervisor acknowledgement timed out")
+
+    runtime._await_supervisor_ack = failed_ack
+    with service.sessions.begin() as session:
+        session.get(RecipeRun, run_id).route_state = "pending"
+    worker = RecipeOperationWorker(service.sessions, service, clock=clock)
+    assert worker.tick() is True
+    with service.sessions() as session:
+        run = session.get(RecipeRun, run_id)
+        assert run.route_state == "failed"
+        assert run.route_error.startswith("_ActivatedRecipeRouteError:")
+    runtime._await_supervisor_ack = acknowledged.append
+    assert worker.tick() is False
+    assert acknowledged == []
+    clock.now += timedelta(seconds=31)
+    with service.sessions.begin() as session:
+        if after_failure == "stopped":
+            session.get(RecipeRun, run_id).state = "stopped"
+        elif after_failure == "stale":
+            for node in session.query(RunNode).filter_by(run_id=run_id):
+                node.updated_at = NOW - timedelta(seconds=301)
+    worker.tick()
+    with service.sessions() as session:
+        run = session.get(RecipeRun, run_id)
+        assert (run.route_state == "published") == (after_failure == "healthy")
+    assert bool(acknowledged) == (after_failure == "healthy")
+
+
+def test_ack_lease_expiry_waits_for_fresh_evidence_then_recovers(tmp_path):
+    clock = MutableClock(NOW)
+    base, _, _, run_id = setup(tmp_path / "database", clock=clock)
+    atomic = atomic_service(base, tmp_path / "live", clock)
+    service = RecipeRouteService(
+        base.sessions,
+        publisher=atomic._publisher,
+        management_policy=ManagementAddressPolicy.parse("10.0.0.0/24"),
+        clock=clock,
+        maximum_age_seconds=120,
+    )
+    runtime = service._publisher._publisher
+
+    def expired_ack(marker):
+        clock.now = datetime.fromisoformat(marker.expires_at)
+        raise RuntimeError(
+            "active route lease expired during supervisor acknowledgement"
+        )
+
+    runtime._await_supervisor_ack = expired_ack
+    with service.sessions.begin() as session:
+        session.get(RecipeRun, run_id).route_state = "pending"
+    worker = RecipeOperationWorker(service.sessions, service, clock=clock)
+    assert worker.tick() is True
+    assert clock.now == NOW + timedelta(seconds=120)
+    acknowledged = []
+    runtime._await_supervisor_ack = acknowledged.append
+    clock.now += timedelta(seconds=31)
+    assert worker.tick() is False
+    with service.sessions() as session:
+        run = session.get(RecipeRun, run_id)
+        assert run.route_state == "failed"
+        assert run.route_error.startswith("_ActivatedRecipeRouteError:")
+    assert not acknowledged
+    clock.now += timedelta(seconds=31)
+    with service.sessions.begin() as session:
+        for node in session.query(RunNode).filter_by(run_id=run_id):
+            node.updated_at = clock.now
+    assert worker.tick() is True
+    with service.sessions() as session:
+        assert session.get(RecipeRun, run_id).route_state == "published"
+    assert len(acknowledged) == 1
+    assert datetime.fromisoformat(
+        acknowledged[0].expires_at
+    ) == clock.now + timedelta(seconds=120)

@@ -585,3 +585,54 @@ def test_update_boundary_publication_compare_and_swap_is_atomic_and_idempotent(
             expected_current_digest=desired.digest,
         )
     assert publisher.inspect() == maintenance
+
+
+@pytest.mark.parametrize(
+    "ack_at,expires_after,expected_error", [(45, 120, None), (45, 35, "lease expired")]
+)
+def test_default_ack_wait_allows_cold_start_but_never_extends_evidence(
+    tmp_path, ack_at, expires_after, expected_error
+):
+    from dataclasses import replace
+
+    marker = replace(
+        _publisher(tmp_path).publish(_request()),
+        expires_at=(NOW + timedelta(seconds=expires_after)).isoformat(),
+    )
+    ack_path = tmp_path / "ack.json"
+    elapsed = [0.0]
+
+    def clock():
+        return NOW + timedelta(seconds=elapsed[0])
+
+    def sleep(seconds):
+        elapsed[0] += seconds
+        if elapsed[0] >= ack_at:
+            ack_path.write_text(
+                json.dumps(
+                    {
+                        "acknowledged_at": clock().isoformat(),
+                        "activation_sha256": marker.digest,
+                        "child_pid": 123,
+                        "expires_at": marker.expires_at,
+                        "generation": marker.generation,
+                        "litellm_sha256": marker.litellm_sha256,
+                        "schema_version": 1,
+                        "state": marker.state,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+    acknowledge = FileSupervisorAcknowledger(
+        ack_path, clock=clock, monotonic=lambda: elapsed[0], sleep=sleep
+    )
+    if expected_error:
+        with pytest.raises(RouteRuntimeError, match=expected_error):
+            acknowledge(marker)
+        assert elapsed[0] < ack_at
+    else:
+        acknowledge(marker)
+        assert elapsed[0] >= ack_at
