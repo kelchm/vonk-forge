@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 
 const DIAGNOSTIC_LIMIT: u64 = 64 * 1024;
-const DIAGNOSTIC_TRUNCATED: &[u8] = b"[earlier diagnostic output truncated]\n";
+pub(crate) const DIAGNOSTIC_TRUNCATED: &[u8] = b"[earlier diagnostic output truncated]\n";
 const DISK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
