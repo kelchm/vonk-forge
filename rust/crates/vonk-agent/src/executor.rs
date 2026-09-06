@@ -1737,6 +1737,8 @@ pub enum LoopError {
     State(#[from] StateError),
     #[error("agent heartbeat task failed")]
     HeartbeatTask,
+    #[error("agent heartbeat lease expired before renewal")]
+    HeartbeatLeaseExpired,
     #[error("agent readiness publication failed: {0}")]
     Readiness(String),
 }
@@ -1984,9 +1986,12 @@ async fn run_heartbeats<C: LoopClient>(
     let mut deadline = claim.deadline;
     let mut cancellation_observed = false;
     loop {
+        let remaining = (deadline - Utc::now().fixed_offset())
+            .to_std()
+            .map_err(|_| LoopError::HeartbeatLeaseExpired)?;
         tokio::select! {
             _ = &mut stop => return Ok(cancellation_observed),
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(interval.min(remaining)) => {}
         }
         let progress = AgentProgress {
             attempt: claim.attempt,
@@ -1998,7 +2003,24 @@ async fn run_heartbeats<C: LoopClient>(
             progress: json!({"phase": "executing"}),
             schema_version: claim.schema_version,
         };
-        let directive = client.heartbeat(&progress).await?;
+        let remaining = (deadline - Utc::now().fixed_offset())
+            .to_std()
+            .map_err(|_| LoopError::HeartbeatLeaseExpired)?;
+        let response = tokio::select! {
+            _ = &mut stop => return Ok(cancellation_observed),
+            response = tokio::time::timeout(remaining, client.heartbeat(&progress)) => response,
+        };
+        let directive = match response {
+            Ok(Ok(directive)) => directive,
+            Ok(Err(error)) if error.retryable() => {
+                // A dropped connection or temporary controller rejection does
+                // not revoke the last confirmed lease, and cannot extend it.
+                // Retry on the normal cadence using the unchanged exact fence.
+                continue;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(LoopError::HeartbeatLeaseExpired),
+        };
         state.apply_heartbeat(&progress, &directive)?;
         lease_deadline.send_replace(directive.deadline);
         deadline = directive.deadline;
@@ -2033,7 +2055,7 @@ mod tests {
         net::TcpListener,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
@@ -2291,6 +2313,7 @@ mod tests {
         cancel_requested: bool,
         claim: Arc<Mutex<Option<AgentClaim>>>,
         fail_heartbeat: bool,
+        retryable_heartbeats: Arc<AtomicUsize>,
         heartbeats: Arc<Mutex<Vec<AgentProgress>>>,
         results: Arc<Mutex<Vec<AgentResult>>>,
     }
@@ -2309,6 +2332,15 @@ mod tests {
         async fn heartbeat(&self, progress: &AgentProgress) -> Result<AgentDirective, ClientError> {
             self.heartbeats.lock().unwrap().push(progress.clone());
             if self.fail_heartbeat {
+                return Err(ClientError::Authentication);
+            }
+            if self
+                .retryable_heartbeats
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
                 return Err(ClientError::Retryable);
             }
             Ok(AgentDirective {
@@ -2441,6 +2473,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2478,6 +2511,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(original.clone()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: heartbeats.clone(),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2515,13 +2549,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn heartbeat_failure_leaves_a_durable_terminal_result_not_a_busy_attempt() {
+    async fn heartbeat_authentication_failure_leaves_a_durable_terminal_result_not_a_busy_attempt()
+    {
         let directory = tempdir().unwrap();
         let heartbeats = Arc::new(Mutex::new(Vec::new()));
         let client = RecordingClient {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: true,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: heartbeats.clone(),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2549,9 +2585,95 @@ mod tests {
 
         assert!(matches!(
             error,
-            super::LoopError::Client(ClientError::Retryable)
+            super::LoopError::Client(ClientError::Authentication)
         ));
         assert_eq!(state.pending_results().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heartbeat_transient_failures_recover_without_minting_a_deadline() {
+        let directory = tempdir().unwrap();
+        let original = claim();
+        let heartbeats = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingClient {
+            cancel_requested: false,
+            claim: Arc::new(Mutex::new(Some(original.clone()))),
+            fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(2)),
+            heartbeats: heartbeats.clone(),
+            results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let executor = HeartbeatGatedExecutor {
+            heartbeats,
+            minimum: 4,
+            observed_deadline: Arc::new(Mutex::new(None)),
+        };
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        run_once_with_heartbeat_interval(
+            &client,
+            &mut state,
+            &executor,
+            RunOncePolicy {
+                capabilities: &["recipe.install"],
+                wait_seconds: 0,
+                runtime_identity: None,
+                heartbeat_interval: Duration::from_millis(10),
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        let sent = client.heartbeats.lock().unwrap();
+        assert!(sent.len() >= 4);
+        for progress in &sent[..3] {
+            assert_eq!(progress.deadline, original.deadline);
+            assert_eq!(progress.fence, original.fence);
+        }
+        assert!(sent[3].deadline > original.deadline);
+        assert_eq!(client.results.lock().unwrap().len(), 1);
+        assert!(state.pending_results().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_retries_stop_at_the_last_authorized_deadline() {
+        let directory = tempdir().unwrap();
+        let mut original = claim();
+        original.deadline = (Utc::now() + ChronoDuration::milliseconds(60)).fixed_offset();
+        let heartbeats = Arc::new(Mutex::new(Vec::new()));
+        let client = RecordingClient {
+            cancel_requested: false,
+            claim: Arc::new(Mutex::new(None)),
+            fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(usize::MAX)),
+            heartbeats: heartbeats.clone(),
+            results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut state = StateStore::open(&directory.path().join("state.sqlite"), NODE_ID).unwrap();
+        state.begin(&original, Utc::now()).unwrap();
+        let (_stop, stopped) = tokio::sync::oneshot::channel();
+        let (lease, deadline) = tokio::sync::watch::channel(original.deadline);
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let error = super::run_heartbeats(
+            client,
+            state,
+            original.clone(),
+            lease,
+            cancel,
+            stopped,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, super::LoopError::HeartbeatLeaseExpired));
+        assert_eq!(*deadline.borrow(), original.deadline);
+        assert!(!*cancellation.borrow());
+        assert!(
+            heartbeats
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|progress| progress.deadline == original.deadline)
+        );
     }
 
     #[tokio::test]
@@ -2561,6 +2683,7 @@ mod tests {
             cancel_requested: false,
             claim: Arc::new(Mutex::new(Some(claim()))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2681,6 +2804,7 @@ mod tests {
             cancel_requested: true,
             claim: Arc::new(Mutex::new(Some(job_claim))),
             fail_heartbeat: false,
+            retryable_heartbeats: Arc::new(AtomicUsize::new(0)),
             heartbeats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         };
