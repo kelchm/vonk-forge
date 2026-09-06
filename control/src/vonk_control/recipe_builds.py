@@ -600,14 +600,9 @@ class RecipeBuildService:
             build = _canonical_build(document)
             source_sha256 = _source_bundle_handle(revision)
             public_network = _public_build_network(build)
-            if (
-                public_network
-                and "recipe.build.egress-proxy.v1" not in node.capabilities
-            ):
-                raise RecipeBuildError(
-                    "build.network_capability_missing",
-                    "builder does not advertise the hostname-aware build egress boundary",
-                )
+            # Claim capabilities name operations, whereas the egress boundary
+            # is host-probed inventory evidence. Check that fresh evidence below;
+            # a routine job claim legitimately omits the inventory-only flag.
             assert node.binary_digest is not None
             builder_binary_digest = node.binary_digest
             stored = session.get(RecipeSourceBundle, source_sha256)

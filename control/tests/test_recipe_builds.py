@@ -865,13 +865,14 @@ def test_build_plan_accepts_public_network_only_with_egress_boundary_capability(
         node = session.get(AgentNode, node_id)
         assert node is not None
         node.capabilities = ["recipe.build.v1", "recipe.image.import.v1"]
-    with pytest.raises(RecipeBuildError, match="hostname-aware build egress"):
-        RecipeBuildService(sessions, bundles=bundles).plan(
-            revision.id, node_id, now=now
-        )
+    # The ordinary Rust claim contains operation names, not host-probed flags.
+    accepted = RecipeBuildService(sessions, bundles=bundles).plan(
+        revision.id, node_id, now=now
+    )
+    assert accepted.agent_payload["network"] == plan.agent_payload["network"]
 
 
-def test_public_build_rejects_stale_inventory_without_egress_capability(
+def test_public_build_rejects_fresh_inventory_without_egress_capability(
     tmp_path: Path,
 ) -> None:
     sessions, bundles, now, node_id, revision = setup(
@@ -1247,3 +1248,14 @@ def test_image_distribution_requires_the_previewed_plan_digest(
     assert operation.kind == "recipe.image.import.v1"
     assert operation.plan_digest == preview.plan_digest
     assert operation.nodes == (builder, target)
+
+
+def test_public_build_rejects_stale_proof_of_egress_capability(tmp_path):
+    sessions, bundles, now, node_id, revision = setup(
+        tmp_path, network={"mode": "public", "hosts": ["pypi.org"]}
+    )
+    with pytest.raises(RecipeBuildError) as caught:
+        RecipeBuildService(sessions, bundles=bundles).plan(
+            revision.id, node_id, now=now + timedelta(seconds=301)
+        )
+    assert caught.value.code == "build.inventory_stale"
