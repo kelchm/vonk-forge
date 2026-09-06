@@ -1174,6 +1174,73 @@ def test_ack_lease_expiry_waits_for_fresh_evidence_then_recovers(tmp_path):
     with service.sessions() as session:
         assert session.get(RecipeRun, run_id).route_state == "published"
     assert len(acknowledged) == 1
+    assert datetime.fromisoformat(acknowledged[0].expires_at) == clock.now + timedelta(
+        seconds=120
+    )
+
+
+@pytest.mark.parametrize("ack_delay", [45, 121])
+def test_empty_withdrawal_lease_is_independent_of_rank_evidence_age(
+    tmp_path, ack_delay
+):
+    from vonk_control.route_runtime import FileSupervisorAcknowledger
+
+    clock = MutableClock(NOW)
+    base, _, _, run_id = setup(tmp_path / "database", clock=clock)
+    atomic = atomic_service(base, tmp_path / "live", clock)
+    service = RecipeRouteService(
+        base.sessions,
+        publisher=atomic._publisher,
+        management_policy=ManagementAddressPolicy.parse("10.0.0.0/24"),
+        clock=clock,
+        maximum_age_seconds=30,
+    )
+    first = service.publish_run(run_id)
     assert datetime.fromisoformat(
-        acknowledged[0].expires_at
-    ) == clock.now + timedelta(seconds=120)
+        first.activation_marker.expires_at
+    ) == NOW + timedelta(seconds=30)
+    runtime = service._publisher._publisher
+    ack_path = tmp_path / "ack.json"
+    observed = []
+
+    def acknowledge_after_reload(marker):
+        observed.append(marker)
+        assert marker.state == "maintenance"
+        assert datetime.fromisoformat(marker.expires_at) == NOW + timedelta(seconds=120)
+        clock.now += timedelta(seconds=ack_delay)
+        ack_path.write_text(
+            json.dumps(
+                {
+                    "acknowledged_at": clock.now.isoformat(),
+                    "activation_sha256": marker.digest,
+                    "child_pid": 123,
+                    "expires_at": marker.expires_at,
+                    "generation": marker.generation,
+                    "litellm_sha256": marker.litellm_sha256,
+                    "schema_version": 1,
+                    "state": marker.state,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        FileSupervisorAcknowledger(ack_path, clock=clock)(marker)
+
+    runtime._await_supervisor_ack = acknowledge_after_reload
+    if ack_delay > 120:
+        with pytest.raises(RecipeRouteError, match="lease expired"):
+            service.withdraw_run(run_id)
+    else:
+        service.withdraw_run(run_id)
+        with service.sessions() as session:
+            assert session.get(RecipeRun, run_id).route_state == "withdrawn"
+        with pytest.raises(RecipeRouteNotReady, match="evidence is stale"):
+            service.publish_run(run_id)
+    assert len(observed) == 1
+    document = json.loads(
+        (
+            tmp_path / "live/generations" / observed[0].directory / "litellm.json"
+        ).read_text()
+    )
+    assert document["model_list"] == []
