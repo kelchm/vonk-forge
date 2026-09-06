@@ -1,5 +1,5 @@
 import {useCallback, useEffect, useRef, useState} from "react";
-import type {LibraryRecipeDetail, LibrarySnapshot, PublicRecipe} from "../api/types";
+import type {LibraryRecipeDetail, LibrarySnapshot, PublicRecipe, VisualFleetSnapshot} from "../api/types";
 import type {LibraryApi, LibraryOperation} from "../api/types";
 import {formatBytes} from "../lib/fleet";
 import {StatusPill} from "./status-pill";
@@ -65,6 +65,25 @@ function nextActionCopy(name: LibraryActionName): {description: string; title: s
   return {title: `Review ${name.toLocaleLowerCase()}`, description: "Review the current server-authoritative plan before changing lifecycle state."};
 }
 
+function activeRunCopy(detail: LibraryRecipeDetail, fleet?: VisualFleetSnapshot) {
+  const runs = detail.operational_state.runs.filter(run => ["running", "published"].includes(run.state));
+  if (runs.length === 0) return undefined;
+  // Artifact-job sessions are active without publishing an inference route.
+  if (!detail.visual_recipe?.interfaces.some(item => item.adapter === "openai")) {
+    return {title: "Run is active", description: "Use Fleet to review current node and workload health before changing lifecycle state.", attention: false};
+  }
+  const evidence = fleet?.nodes.flatMap(node => (node.loaded ?? []).map(run => ({nodeId: node.id, ...run}))) ?? [];
+  const matches = (runId: string) => evidence.filter(item => item.run_id === runId && item.recipe_id === detail.recipe.recipe_id);
+  const healthy = (item: (typeof evidence)[number]) => item.healthy && item.group_state === "healthy" && item.rank_fresh && item.rank_state === "running" && item.run_state === "running" && item.route_state === "published";
+  if (runs.some(run => run.route_state !== "published" || matches(run.run_id).some(item => !healthy(item)))) {
+    return {title: "Active run needs attention", description: "An active run has an unpublished route or unhealthy rank evidence. Review Fleet for route and workload details before changing its lifecycle.", attention: true};
+  }
+  if (runs.every(run => run.node_ids.length > 0 && run.node_ids.every(nodeId => matches(run.run_id).some(item => item.nodeId === nodeId && healthy(item))))) {
+    return {title: "Model is serving", description: "Current Fleet evidence shows healthy ranks and published routes. Use Fleet to monitor node and workload health.", attention: false};
+  }
+  return {title: "Check active run health", description: "An active run is recorded, but current healthy serving evidence is unavailable. Review Fleet before changing its lifecycle.", attention: true};
+}
+
 function useNarrowViewport(query: string): boolean {
   const [matches, setMatches] = useState(() => typeof window !== "undefined" && window.matchMedia?.(query).matches === true);
   useEffect(() => {
@@ -78,10 +97,11 @@ function useNarrowViewport(query: string): boolean {
   return matches;
 }
 
-export function LibraryRecipeAuthority({api, catalogRecipe, detail, onBusyChange, onRefresh, policy, preferredNodeId}: {
+export function LibraryRecipeAuthority({api, catalogRecipe, detail, fleet, onBusyChange, onRefresh, policy, preferredNodeId}: {
   api: LibraryApi;
   catalogRecipe?: PublicRecipe;
   detail: LibraryRecipeDetail;
+  fleet?: VisualFleetSnapshot;
   onBusyChange?(busy: boolean): void;
   onRefresh(signal: AbortSignal): Promise<void>;
   policy: LibrarySnapshot["freshness_policy"];
@@ -129,7 +149,7 @@ export function LibraryRecipeAuthority({api, catalogRecipe, detail, onBusyChange
     lifecycleStage("Install", detail.operational_state.installations, ["installed"]),
     lifecycleStage("Run", detail.operational_state.runs, ["running", "published"], "Active"),
   ];
-  const activeRun = detail.operational_state.runs.some(run => ["running", "published"].includes(run.state));
+  const activeRun = activeRunCopy(detail, fleet);
   const placementRecommendation = activeRun ? undefined : primaryPlacementRecommendation(detail);
   const recommendedName = placementRecommendation ? actionName(placementRecommendation.target) : undefined;
   const recommendationCopy = recommendedName ? nextActionCopy(recommendedName) : undefined;
@@ -153,12 +173,12 @@ export function LibraryRecipeAuthority({api, catalogRecipe, detail, onBusyChange
       </div>
     </header>
     <LibraryRecipeFit catalogRecipe={catalogRecipe} detail={detail}/>
-    <section className={`recipe-next-action${activeRun ? " is-running" : placementRecommendation ? "" : " is-blocked"}`} aria-label="Recommended next action">
+    <section className={`recipe-next-action${activeRun ? activeRun.attention ? " is-blocked" : " is-running" : placementRecommendation ? "" : " is-blocked"}`} aria-label="Recommended next action">
       <div>
         <p className="fleet-kicker">Recommended next step</p>
-        <h4>{activeRun ? "Model is running" : recommendationCopy?.title ?? "Resolve placement readiness"}</h4>
+        <h4>{activeRun?.title ?? recommendationCopy?.title ?? "Resolve placement readiness"}</h4>
         <p>{activeRun
-          ? "No lifecycle change is required. Use Fleet for live node, route, and workload health."
+          ? activeRun.description
           : recommendationCopy?.description ?? "No complete Spark group currently exposes an authorized lifecycle action. Review placement blockers and evidence below."}</p>
       </div>
       {activeRun

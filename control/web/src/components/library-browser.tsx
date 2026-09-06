@@ -44,7 +44,7 @@ export function LibraryBrowser({api, catalogCommit, catalogError, catalogLoading
       catalogCommit={catalogCommit}
       catalogRepository={catalogRepository}
       detail={detail}
-      detailContent={route.kind === "recipe" && detail ? <LibraryRecipeAuthority api={api} catalogRecipe={publicByLocalRecipe.get(detail.recipe.recipe_id)} detail={detail} onBusyChange={onBusyChange} onRefresh={onRefresh} policy={snapshot.freshness_policy} preferredNodeId={preferredNodeId}/> : undefined}
+      detailContent={route.kind === "recipe" && detail ? <LibraryRecipeAuthority api={api} catalogRecipe={publicByLocalRecipe.get(detail.recipe.recipe_id)} detail={detail} fleet={fleetError ? undefined : fleet} onBusyChange={onBusyChange} onRefresh={onRefresh} policy={snapshot.freshness_policy} preferredNodeId={preferredNodeId}/> : undefined}
       detailError={detailError}
       detailLoading={detailLoading}
       fleet={fleet}
