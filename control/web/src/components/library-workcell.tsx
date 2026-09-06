@@ -384,6 +384,9 @@ export function LibraryWorkcell({
   const activeDetail = detail && detail.recipe.recipe_id === selectedRecipeId ? detail : placementDetail;
   const selectedRecipeDetail = detail && detail.recipe.recipe_id === selectedRecipeId ? detail : undefined;
   const selectedInstallations = selectedRecipeDetail?.operational_state.installations.filter(installation => installation.state !== "uninstalled") ?? [];
+  const selectedInstallationNodeCount = new Set(selectedInstallations.flatMap(installation => installation.node_ids)).size;
+  const selectedInstallationsComplete = selectedInstallations.every(installation => installation.state === "installed");
+  const selectedInstallationsInProgress = selectedInstallations.every(installation => installation.state === "installing");
   const selectedActiveRuns = selectedRecipeDetail?.operational_state.runs.filter(run => ["running", "published"].includes(run.state)) ?? [];
   const selectedHasFleetRun = Boolean(selectedRecipeId && fleet?.nodes.some(node => (node.loaded ?? []).some(run => run.recipe_id === selectedRecipeId)));
   const selectedHasActiveRun = selectedActiveRuns.length > 0 || selectedHasFleetRun;
@@ -555,10 +558,10 @@ export function LibraryWorkcell({
       <aside className="library-pane library-spark-rail" aria-label="Sparks">
         <div className="library-pane-heading"><div><h3>Sparks</h3></div><small>{fleet?.nodes.length ?? 0} enrolled</small></div>
         {selectedRecord && selectedInstallations.length > 0 && <section className="library-removal-overview" aria-label={`Remove ${selectedRecord.title}`}>
-          <div><strong>Installed recipe</strong><span>{selectedRecord.title} occupies {new Set(selectedInstallations.flatMap(installation => installation.node_ids)).size} Spark{new Set(selectedInstallations.flatMap(installation => installation.node_ids)).size === 1 ? "" : "s"}.</span></div>
+          <div><strong>{selectedInstallationsComplete ? "Installed recipe" : selectedInstallationsInProgress ? "Installation in progress" : "Installation status"}</strong><span>{selectedRecord.title} {selectedInstallationsComplete ? "is installed on" : selectedInstallationsInProgress ? "is installing on" : "has placements on"} {selectedInstallationNodeCount} Spark{selectedInstallationNodeCount === 1 ? "" : "s"}.</span></div>
           {selectedHasActiveRun && <p className="is-warning">Active runs must stop before removal. You can still review the exact blocked plan.</p>}
           {selectedInstallations.map((installation, index) => <div className="library-removal-placement" key={installation.installation_id}>
-            <span>Placement {selectedInstallations.length > 1 ? index + 1 : ""} · {installation.node_ids.map(nodeId => fleet?.nodes.find(node => node.id === nodeId)?.display_name ?? nodeId).join(" + ")}</span>
+            <span>Placement {selectedInstallations.length > 1 ? index + 1 : ""} · {humanizeIdentifier(installation.state)} · {installation.node_ids.map(nodeId => fleet?.nodes.find(node => node.id === nodeId)?.display_name ?? nodeId).join(" + ")}</span>
             <button type="button" className="button secondary" disabled={removalOperation !== undefined && !operationSettled(removalOperation.state)} onClick={event => { removalTrigger.current = event.currentTarget; setRecipeRemovalId(installation.installation_id); }}>Review recipe removal</button>
           </div>)}
           <small>The catalog recipe remains available. The Controller preview decides whether shared model files stay on each Spark.</small>

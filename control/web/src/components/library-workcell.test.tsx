@@ -2,7 +2,7 @@ import {render, screen, within} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type {ControlApi, LibrarySnapshot, PublicRecipe, VisualFleetNode, VisualFleetSnapshot} from "../api/types";
 import {App} from "../app";
-import {librarySnapshot} from "../test-fixtures/library";
+import {fullLibraryDetail, librarySnapshot} from "../test-fixtures/library";
 import {buildLibraryRecipeRecords, EMPTY_LIBRARY_WORKCELL_FILTERS, filterLibraryRecipeRecords, sparkPlacementState} from "./library-workcell";
 
 const GIB = 1024 ** 3;
@@ -80,4 +80,38 @@ test("preserves live Spark state projection for operational placement", () => {
   const record = buildLibraryRecipeRecords(librarySnapshot, [catalogRecipe({local: {status: "update-available", recipe_id: "recipe-chat", revision_number: 1, content_sha256: "a".repeat(64), release_version: "0.9.0"}})])[0]!;
   expect(sparkPlacementState(node("spark-1", "Spark One", ["recipe-chat"]), [record])).toBe("update");
   expect(sparkPlacementState({...node("spark-1", "Spark One"), connection: {...node("spark-1", "Spark One").connection, online_state: "offline", offline_reason: "stale"}}, [record])).toBe("offline");
+});
+
+test.each([
+  {state: "installed", heading: "Installed recipe", description: "Qwen Chat is installed on 2 Sparks."},
+  {state: "installing", heading: "Installation in progress", description: "Qwen Chat is installing on 2 Sparks."},
+  {state: "failed", heading: "Installation status", description: "Qwen Chat has placements on 2 Sparks."},
+] as const)("describes $state placement without implying premature completion", async ({state, heading, description}) => {
+  history.replaceState(null, "", "/library/recipes/recipe-chat");
+  const detail = structuredClone(fullLibraryDetail);
+  detail.operational_state.installations[0].state = state;
+  const api = {librarySnapshot: async () => librarySnapshot, libraryRecipe: async () => detail, listPublicRecipes: async () => ({repository: "CarstVaartjes/vonk-forge-recipes", commit: "c".repeat(40), recipes: [catalogRecipe()]}), visualFleet: async () => fleet([node("node-alpha", "Spark One"), node("node-beta", "Spark Two")])} as unknown as ControlApi;
+  render(<App api={api}/>);
+  const status = await screen.findByRole("region", {name: "Remove Qwen Chat"});
+  expect(within(status).getByText(heading)).toBeVisible();
+  expect(status).toHaveTextContent(description);
+  expect(status).toHaveTextContent(`· ${state[0].toUpperCase()}${state.slice(1)} ·`);
+  expect(within(status).getByRole("button", {name: "Review recipe removal"})).toBeEnabled();
+  if (state !== "installed") expect(status).not.toHaveTextContent(/Installed recipe|is installed on|occupies/);
+});
+
+test("keeps mixed placement states explicit and excludes removed installations", async () => {
+  history.replaceState(null, "", "/library/recipes/recipe-chat");
+  const detail = structuredClone(fullLibraryDetail);
+  const installed = detail.operational_state.installations[0];
+  detail.operational_state.installations.push({...installed, installation_id: "installing-chat", state: "installing"}, {...installed, installation_id: "removed-chat", node_ids: ["removed-node"], state: "uninstalled"});
+  const api = {librarySnapshot: async () => librarySnapshot, libraryRecipe: async () => detail, visualFleet: async () => fleet([node("node-alpha", "Spark One"), node("node-beta", "Spark Two")])} as unknown as ControlApi;
+  render(<App api={api}/>);
+  const status = await screen.findByRole("region", {name: "Remove Qwen Chat"});
+  expect(within(status).getByText("Installation status")).toBeVisible();
+  expect(status).toHaveTextContent("Qwen Chat has placements on 2 Sparks.");
+  expect(status).toHaveTextContent("Placement 1 · Installed");
+  expect(status).toHaveTextContent("Placement 2 · Installing");
+  expect(status).not.toHaveTextContent(/Installed recipe|removed-node|Uninstalled/);
+  expect(within(status).getAllByRole("button", {name: "Review recipe removal"})).toHaveLength(2);
 });
