@@ -41,6 +41,7 @@ _ALIAS = re.compile(r"[a-z0-9][a-z0-9._-]{0,62}\Z")
 _UPSTREAM_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,119}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _HEALTH_RECOVERY_ERROR = "recipe rank health requires recovery"
+_EMPTY_ROUTE_LEASE = timedelta(seconds=120)
 _SQLITE_ROUTE_PUBLICATION_LOCK = threading.RLock()
 
 
@@ -721,7 +722,10 @@ class RecipeRouteService:
         publish_empty = self._publisher.publish_empty
         if isinstance(self._publisher, AtomicRecipeRoutePublisher):
             return publish_empty(
-                route_digest, expires_at=_aware(self._clock()) + self._maximum_age
+                # An empty route grants no model authority. Give its LiteLLM
+                # reload a full startup window independently of the API's
+                # stricter rank-evidence freshness budget.
+                route_digest, expires_at=_aware(self._clock()) + _EMPTY_ROUTE_LEASE
             )
         return publish_empty(route_digest)
 
@@ -940,11 +944,12 @@ class RecipeRouteService:
                         )
             for node in nodes:
                 observed = _aware(node.updated_at)
-                if (
-                    observed > now.astimezone(UTC)
-                    or now.astimezone(UTC) - observed >= self._maximum_age
-                ):
+                if observed > now.astimezone(UTC):
                     raise RecipeRouteError(
+                        "recipe rank readiness evidence is stale", run_id=run.id
+                    )
+                if now.astimezone(UTC) - observed >= self._maximum_age:
+                    raise RecipeRouteNotReady(
                         "recipe rank readiness evidence is stale", run_id=run.id
                     )
                 if (

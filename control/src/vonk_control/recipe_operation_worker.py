@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .models import RecipeRun, RunNode
@@ -61,7 +61,17 @@ class RecipeOperationWorker:
                     select(RecipeRun.id)
                     .where(
                         RecipeRun.state == "running",
-                        RecipeRun.route_state == "pending",
+                        or_(
+                            RecipeRun.route_state == "pending",
+                            and_(
+                                RecipeRun.route_state == "failed",
+                                RecipeRun.route_error.startswith(
+                                    "_ActivatedRecipeRouteError:"
+                                ),
+                                RecipeRun.updated_at
+                                <= self._clock() - timedelta(seconds=30),
+                            ),
+                        ),
                     )
                     .order_by(RecipeRun.created_at, RecipeRun.id)
                 )
@@ -70,11 +80,17 @@ class RecipeOperationWorker:
             try:
                 self._routes.publish_run(run_id)
             except RecipeRouteNotReady:
+                with self._sessions.begin() as session:
+                    run = session.get(RecipeRun, run_id)
+                    if run is not None and run.route_state == "failed":
+                        # Keep activation retry eligibility while waiting for
+                        # fresh rank evidence, with the same bounded cadence.
+                        run.updated_at = self._clock()
                 continue
             except (OSError, RuntimeError, TypeError, ValueError) as error:
                 with self._sessions.begin() as session:
                     run = session.get(RecipeRun, run_id)
-                    if run is not None and run.route_state == "pending":
+                    if run is not None and run.route_state in {"pending", "failed"}:
                         run.route_state = "failed"
                         run.route_error = f"{type(error).__name__}: {error}"[:512]
                         run.updated_at = self._clock()
