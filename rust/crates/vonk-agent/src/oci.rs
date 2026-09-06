@@ -901,7 +901,12 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
                 return Err(OciError::Artifact);
             }
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                // Job cleanup can remove an enumerated directory concurrently.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let run_id = entry
                 .file_name()
                 .into_string()
@@ -951,7 +956,22 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
                 return Err(OciError::Artifact);
             }
             let retained =
-                self.prepare_retained_start(&spec, &installation_id, &run_id, &placement)?;
+                match self.prepare_retained_start(&spec, &installation_id, &run_id, &placement) {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        // A stop may unlink the marker after the first read. Only
+                        // proven removal is a transition; live corruption fails.
+                        if self
+                            .read_run_lifecycle(
+                                &self.run_metadata_path(&run_id)?.join("lifecycle.json"),
+                            )?
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
             let mut arguments = vec![retained.image_digest];
             arguments.extend(retained.main);
             if binding.runtime_arguments_sha256
@@ -1015,7 +1035,12 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
                 return Err(OciError::Artifact);
             }
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                // Job cleanup can remove an enumerated directory concurrently.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let run_id = entry
                 .file_name()
                 .into_string()
@@ -1117,7 +1142,18 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
             return Err(OciError::Artifact);
         }
         managed_path(self.data_root, "installations", &record.installation_id)?;
-        let spec = self.load_spec(&record.installation_id)?;
+        let spec = match self.load_spec(&record.installation_id) {
+            Ok(spec) => spec,
+            Err(OciError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Stop removes the lifecycle before a later uninstall removes
+                // installation metadata. Do not turn that race into a crash.
+                if self.read_run_lifecycle(&path)?.is_none() {
+                    return Ok(None);
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Some((
             spec,
             record.installation_id,
@@ -1138,7 +1174,15 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
         {
             return Err(OciError::Artifact);
         }
-        let record: RunLifecycle = serde_json::from_slice(&read_regular_file(path, 16 * 1024)?)?;
+        let raw = match read_regular_file(path, 16 * 1024) {
+            Ok(raw) => raw,
+            // Atomic stop can unlink the marker between metadata and open.
+            Err(OciError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let record: RunLifecycle = serde_json::from_slice(&raw)?;
         Ok(Some(record))
     }
 
