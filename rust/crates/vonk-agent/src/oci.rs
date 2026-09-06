@@ -741,6 +741,15 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
     }
 
     pub fn recipe_run_inspection_plans(&self) -> Result<Vec<RecipeRunInspectionPlan>, OciError> {
+        self.recipe_run_inspection_plans_after_load(|_| {})
+    }
+
+    // The no-op production hook permits a deterministic stop/uninstall race
+    // regression at the captured-lifecycle boundary, without replacing reads.
+    fn recipe_run_inspection_plans_after_load(
+        &self,
+        after_load: impl Fn(&str),
+    ) -> Result<Vec<RecipeRunInspectionPlan>, OciError> {
         let runs = self.data_root.join("runs");
         let metadata = match fs::symlink_metadata(&runs) {
             Ok(metadata) => metadata,
@@ -787,52 +796,56 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
             let Some(binding) = observation else {
                 continue;
             };
-            binding.validate().map_err(|_| OciError::Artifact)?;
-            if binding.run_id.to_string() != run_id
-                || binding.installation_id.to_string() != installation_id
-                || binding.rank != placement.rank
-                || binding.role != placement.role
-                || binding.world_size != placement.world_size
-                || Some(binding.local_address) != placement.local_address
-                || Some(binding.master_address) != placement.master_address
-                || Some(binding.master_port) != placement.master_port
-                || binding.port != placement.port
-                || binding.recipe_content_sha256 != self.recipe_digest(&installation_id)?
-                || binding.artifact_set_digest != self.artifact_set_digest(&installation_id)?
-                || binding.image_digest != spec.runtime_image.image_digest[7..]
-                || binding.model_identity
-                    != spec
-                        .artifacts
-                        .first()
-                        .map(|artifact| {
-                            format!(
-                                "{}/{}@{}",
-                                artifact.model.publisher,
-                                artifact.model.slug,
-                                artifact.model.content_sha256
-                            )
-                        })
-                        .ok_or(OciError::Artifact)?
-            {
-                return Err(OciError::Artifact);
-            }
-            let retained =
-                match self.prepare_retained_start(&spec, &installation_id, &run_id, &placement) {
-                    Ok(retained) => retained,
-                    Err(error) => {
-                        // A stop may unlink the marker after the first read. Only
-                        // proven removal is a transition; live corruption fails.
-                        if self
-                            .read_run_lifecycle(
-                                &self.run_metadata_path(&run_id)?.join("lifecycle.json"),
-                            )?
-                            .is_none()
-                        {
-                            continue;
-                        }
-                        return Err(error);
+            after_load(&run_id);
+            // Stop/uninstall may remove installation metadata after loading
+            // this lifecycle. Guard every subsequent filesystem read together;
+            // a surviving lifecycle still makes any corruption fail closed.
+            let retained = (|| {
+                binding.validate().map_err(|_| OciError::Artifact)?;
+                if binding.run_id.to_string() != run_id
+                    || binding.installation_id.to_string() != installation_id
+                    || binding.rank != placement.rank
+                    || binding.role != placement.role
+                    || binding.world_size != placement.world_size
+                    || Some(binding.local_address) != placement.local_address
+                    || Some(binding.master_address) != placement.master_address
+                    || Some(binding.master_port) != placement.master_port
+                    || binding.port != placement.port
+                    || binding.recipe_content_sha256 != self.recipe_digest(&installation_id)?
+                    || binding.artifact_set_digest != self.artifact_set_digest(&installation_id)?
+                    || binding.image_digest != spec.runtime_image.image_digest[7..]
+                    || binding.model_identity
+                        != spec
+                            .artifacts
+                            .first()
+                            .map(|artifact| {
+                                format!(
+                                    "{}/{}@{}",
+                                    artifact.model.publisher,
+                                    artifact.model.slug,
+                                    artifact.model.content_sha256
+                                )
+                            })
+                            .ok_or(OciError::Artifact)?
+                {
+                    return Err(OciError::Artifact);
+                }
+                self.prepare_retained_start(&spec, &installation_id, &run_id, &placement)
+            })();
+            let retained = match retained {
+                Ok(retained) => retained,
+                Err(error) => {
+                    if self
+                        .read_run_lifecycle(
+                            &self.run_metadata_path(&run_id)?.join("lifecycle.json"),
+                        )?
+                        .is_none()
+                    {
+                        continue;
                     }
-                };
+                    return Err(error);
+                }
+            };
             let mut arguments = vec![
                 retained.archive_sha256.clone(),
                 retained.registry_index_digest.clone(),
@@ -1696,5 +1709,125 @@ mod tests {
             "cb555393-764b-4eb6-8f15-b416d289428f",
         );
         assert!(matches!(result, Err(OciError::Workload(_))));
+    }
+
+    #[test]
+    fn captured_lifecycle_stop_uninstall_preserves_other_exact_assignment() {
+        use crate::{
+            oci::{OciRuntime, RecipeRunStartIdentity},
+            process::{ProcessError, ProcessOutput, ProcessRunner, Program},
+            workloads::{CompiledExecutionPlan, Placement},
+        };
+        use std::time::Duration;
+        struct NoProcess;
+        impl ProcessRunner for NoProcess {
+            fn run(
+                &self,
+                _: Program,
+                _: &[String],
+                _: Duration,
+            ) -> Result<ProcessOutput, ProcessError> {
+                panic!("exact plan collection must not invoke a process");
+            }
+        }
+        let active = "45ea6921-50c9-4971-be2a-4cd04ce05069";
+        let stopping = "55ea6921-50c9-4971-be2a-4cd04ce05069";
+        let active_installation = "cb555393-764b-4eb6-8f15-b416d289428f";
+        let stopping_installation = "db555393-764b-4eb6-8f15-b416d289428f";
+        for stopped in [true, false] {
+            let data = tempdir().unwrap();
+            let mut value = compiled_plan();
+            value["runtime"]["placement"] = json!({
+                "endpoint_address": "192.168.1.212", "rank": 1, "role": "worker", "world_size": 2,
+                "local_address": "192.168.100.11", "master_address": "192.168.100.10",
+                "master_port": 29500, "port": 8000, "reserved_memory_bytes": 68719476736_u64
+            });
+            value["security"]["network_mode"] = json!("bridge");
+            value["topology"] = json!({
+                "name": "dual", "mode": "distributed", "backend": "nccl",
+                "node_count": 2, "world_size": 2, "rank": 1, "role": "worker"
+            });
+            let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+            let placement: Placement =
+                serde_json::from_value(serde_json::to_value(&plan.runtime.placement).unwrap())
+                    .unwrap();
+            let identity = RecipeRunStartIdentity {
+                mapping_generation: 3,
+                mapping_id: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+                recipe_content_sha256: plan.identity.recipe_revision_sha256.clone(),
+                recipe_revision_id: "22222222-2222-4222-8222-222222222222".parse().unwrap(),
+                run_generation: 2,
+            };
+            let runtime = OciRuntime {
+                runner: &NoProcess,
+                data_root: data.path(),
+                huggingface_curl_config: None,
+            };
+            for (run, installation) in [
+                (active, active_installation),
+                (stopping, stopping_installation),
+            ] {
+                let directory = data.path().join("installations").join(installation);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(
+                    directory.join("spec.json"),
+                    serde_json::to_vec(&plan).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    directory.join("recipe-content.sha256"),
+                    &identity.recipe_content_sha256,
+                )
+                .unwrap();
+                runtime
+                    .prepare_start_with_inspection_identity(
+                        &plan,
+                        installation,
+                        run,
+                        &placement,
+                        &identity,
+                    )
+                    .unwrap();
+            }
+            let result = runtime.recipe_run_inspection_plans_after_load(|run| {
+                if run == stopping {
+                    // The collector already holds this run's complete lifecycle
+                    // and spec. Remove metadata before its next real digest read.
+                    if stopped {
+                        runtime.complete_stop(stopping).unwrap();
+                    }
+                    runtime
+                        .uninstall(stopping_installation, &identity.recipe_content_sha256)
+                        .unwrap();
+                }
+            });
+            if stopped {
+                let plans = result.unwrap();
+                assert_eq!(plans.len(), 1);
+                assert_eq!(plans[0].binding.run_id.to_string(), active);
+                assert_eq!(
+                    plans[0].binding.installation_id.to_string(),
+                    active_installation
+                );
+            } else {
+                // The same missing installation while its lifecycle survives is
+                // live corruption, never permission to publish a partial snapshot.
+                assert!(matches!(result, Err(OciError::Io(_))));
+                assert!(
+                    data.path()
+                        .join("run-metadata")
+                        .join(stopping)
+                        .join("lifecycle.json")
+                        .exists()
+                );
+            }
+            assert!(
+                data.path()
+                    .join("installations")
+                    .join(active_installation)
+                    .join("spec.json")
+                    .is_file()
+            );
+        }
     }
 }
