@@ -694,7 +694,12 @@ def test_terminal_hf_access_failure_requires_explicit_recheck_and_resume(
     assert resumed.progress["downloaded_bytes"] >= len(public_data)
     now[0] = NOW + timedelta(seconds=31)
     _drain(service, resumed.id)
-    assert service.get_operation(resumed.id).state == "succeeded"
+    completed = service.get_operation(resumed.id)
+    assert completed.state == "succeeded", {
+        "state": completed.state,
+        "failure": completed.failure,
+        "progress": completed.progress,
+    }
     assert len(requests) == 5
     service.close()
     client.close()
