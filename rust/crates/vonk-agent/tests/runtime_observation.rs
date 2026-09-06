@@ -128,3 +128,80 @@ fn retained_inspection_preserves_live_tmp_and_cache_but_actual_start_resets_tmp(
     assert!(!marker.exists());
     assert_eq!(fs::read(cache).unwrap(), b"persistent cache");
 }
+
+#[test]
+fn exact_snapshot_survives_atomic_stop_and_job_cleanup_without_losing_live_run() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
+    let root = tempdir().unwrap();
+    let plan = schema2_dual_plan();
+    persist_plan(root.path(), &plan);
+    let runtime = OciRuntime {
+        runner: &NoProcess,
+        data_root: root.path(),
+        huggingface_curl_config: None,
+    };
+    let stopping = "55ea6921-50c9-4971-be2a-4cd04ce05069";
+    let job = "65ea6921-50c9-4971-be2a-4cd04ce05069";
+    for run in [RUN, stopping] {
+        runtime
+            .prepare_start_with_inspection_identity(
+                &plan,
+                INSTALLATION,
+                run,
+                &placement(&plan),
+                &identity(&plan),
+            )
+            .unwrap();
+    }
+    let marker = root
+        .path()
+        .join("run-metadata")
+        .join(stopping)
+        .join("lifecycle.json");
+    let record = fs::read(&marker).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let writer_done = done.clone();
+    let writer_root = root.path().to_path_buf();
+    let writer = thread::spawn(move || {
+        let runtime = OciRuntime {
+            runner: &NoProcess,
+            data_root: &writer_root,
+            huggingface_curl_config: None,
+        };
+        for _ in 0..200 {
+            runtime.complete_stop(stopping).unwrap();
+            fs::create_dir_all(writer_root.join("runs").join(job)).unwrap();
+            runtime.cleanup_job_scope(job).unwrap();
+            let temporary = marker.with_extension("pending");
+            fs::write(&temporary, &record).unwrap();
+            fs::rename(temporary, &marker).unwrap();
+        }
+        runtime.complete_stop(stopping).unwrap();
+        writer_done.store(true, Ordering::SeqCst);
+    });
+    let mut cycles = 0;
+    while !done.load(Ordering::SeqCst) || cycles < 200 {
+        let snapshot = runtime.recipe_run_inspection_plans().unwrap();
+        assert!(
+            snapshot
+                .iter()
+                .any(|plan| plan.binding.run_id.to_string() == RUN)
+        );
+        assert!(
+            snapshot
+                .iter()
+                .all(|plan| [RUN, stopping].contains(&plan.binding.run_id.to_string().as_str()))
+        );
+        cycles += 1;
+    }
+    writer.join().unwrap();
+    let snapshot = runtime.recipe_run_inspection_plans().unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].binding.run_id.to_string(), RUN);
+}
