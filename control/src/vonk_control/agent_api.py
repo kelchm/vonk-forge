@@ -1924,6 +1924,58 @@ def install_agent_routes(
                     raise ValueError("recipe run observation version is invalid")
                 by_run = {run.run_id: run for run in exact}
                 with required.sessions.begin() as session:
+                    # Native agents send one exact rank per report. A completed
+                    # inspection may arrive after its run begins stopping. Only
+                    # a genuine prior grant/receipt gets a typed transition; no
+                    # stopped health, grant consumption, or other rank change
+                    # may persist from this transaction. Mixed batches retain
+                    # the existing strict assignment validation below.
+                    if len(exact) == 1:
+                        evidence = exact[0]
+                        run = session.get(
+                            RecipeRun, evidence.run_id, with_for_update=True
+                        )
+                        run_node = session.scalar(
+                            select(RunNode).where(
+                                RunNode.run_id == evidence.run_id,
+                                RunNode.node_id == identity.node_id,
+                            )
+                        )
+                        if (
+                            run is not None
+                            and run_node is not None
+                            and run.state in {"stopping", "stopped"}
+                            and evidence.node_id == identity.node_id
+                        ):
+                            if (
+                                evidence.observed_at.tzinfo is None
+                                or evidence.observed_at.utcoffset() is None
+                            ):
+                                raise ValueError(
+                                    "recipe run observation time must be timezone-aware"
+                                )
+                            try:
+                                authority.consume_recipe_run_observation_grant(
+                                    session,
+                                    node_id=identity.node_id,
+                                    certificate_serial=identity.certificate_serial,
+                                    identity=evidence.observation_identity(),
+                                    observed_at=evidence.observed_at.astimezone(UTC),
+                                    received_at=now,
+                                    signed_grant=evidence.grant,
+                                    helper_receipt=evidence.helper_receipt,
+                                    allow_stopped=True,
+                                )
+                            except HostHelperAuthorityError as error:
+                                raise ValueError(
+                                    "stopped recipe run observation is invalid"
+                                ) from error
+                            # Raising within sessions.begin rolls back the
+                            # validated grant's consumption as well as all rows.
+                            raise HTTPException(
+                                status_code=status.HTTP_425_TOO_EARLY,
+                                detail="recipe run observation is not ready",
+                            )
                     assigned = prepare_exact_recipe_run_observation_nodes(
                         session, identity.node_id, observed_at, set(by_run)
                     )
@@ -2024,7 +2076,10 @@ def install_agent_routes(
             if (
                 run is not None
                 and run_node is not None
-                and (run.state == "starting" or run_node.state == "starting")
+                and (
+                    run.state in {"starting", "stopping", "stopped"}
+                    or run_node.state == "starting"
+                )
             ):
                 raise HTTPException(
                     status_code=status.HTTP_425_TOO_EARLY,

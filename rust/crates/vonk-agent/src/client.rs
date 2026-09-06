@@ -1080,6 +1080,9 @@ impl AgentHttpClient {
             })
             .send()
             .await?;
+        if response.status() == StatusCode::TOO_EARLY {
+            return Err(ClientError::ObservationNotReady);
+        }
         if response.status() == StatusCode::NO_CONTENT
             || (response.status() == StatusCode::NOT_FOUND && observations.is_empty())
         {

@@ -19,9 +19,11 @@ use crate::{
         ExactRecipeRunObservation,
     },
     health::{HealthEvidence, wait_ready, wait_ready_until},
-    host_runtime::{HostRuntimeBoundary, HostRuntimeOutcome},
+    host_runtime::{
+        HostRuntimeBoundary, HostRuntimeError, HostRuntimeOutcome, RecipeRunInspectionOutcome,
+    },
     image_importer::ImageImporter,
-    oci::{OciRuntime, RecipeRunStartIdentity},
+    oci::{OciRuntime, RecipeRunInspectionPlan, RecipeRunStartIdentity},
     process::ProcessRunner,
     recipe_builder::RecipeBuilder,
     state::{BeginDecision, StateError, StateStore},
@@ -160,7 +162,7 @@ impl RecipeObservationError {
             self,
             Self::Inspection(crate::host_runtime::HostRuntimeError::Controller(
                 ClientError::ObservationNotReady
-            ))
+            )) | Self::Report(ClientError::ObservationNotReady)
         )
     }
 }
@@ -212,6 +214,31 @@ impl<R> RecipeExecutor<'_, R> {
     where
         R: ProcessRunner,
     {
+        self.report_exact_recipe_run_observations_with(|plan| async move {
+            let request_root = self.runtime_root.join("runtime-requests");
+            HostRuntimeBoundary {
+                client: self.client,
+                request_root: &request_root,
+                helper_socket: Path::new("/run/vonk-forge-package-helper/package-helper.sock"),
+                observation_receipt_public_key: self.observation_receipt_public_key,
+            }
+            .inspect_recipe_run(plan.binding, plan.arguments)
+            .await
+        })
+        .await
+    }
+
+    // Keep the privileged inspection boundary injectable for exact snapshot
+    // regression tests; production always uses the signed-grant boundary above.
+    async fn report_exact_recipe_run_observations_with<F, Fut>(
+        &self,
+        inspect: F,
+    ) -> Result<usize, RecipeObservationError>
+    where
+        R: ProcessRunner,
+        F: Fn(RecipeRunInspectionPlan) -> Fut,
+        Fut: Future<Output = Result<RecipeRunInspectionOutcome, HostRuntimeError>>,
+    {
         let plans = match self.runtime.recipe_run_inspection_plans() {
             Ok(plans) => plans,
             Err(error) => {
@@ -230,46 +257,41 @@ impl<R> RecipeExecutor<'_, R> {
         }
         let observation_count = plans.len();
         let results = stream::iter(plans)
-            .map(|plan| async move {
-                let request_root = self.runtime_root.join("runtime-requests");
-                let boundary = HostRuntimeBoundary {
-                    client: self.client,
-                    request_root: &request_root,
-                    helper_socket: Path::new("/run/vonk-forge-package-helper/package-helper.sock"),
-                    observation_receipt_public_key: self.observation_receipt_public_key,
-                };
-                let endpoint = plan.endpoint_address;
-                let outcome = boundary
-                    .inspect_recipe_run(plan.binding.clone(), plan.arguments)
-                    .await?;
-                // This timestamp is part of the signed-grant freshness proof.
-                // Capture it immediately after the local privileged inspection;
-                // an owner-only HTTP probe follows and remains independently
-                // bounded to five seconds.
-                let observed_at = DateTime::from_timestamp(outcome.receipt.claims.observed_at, 0)
-                    .ok_or(crate::host_runtime::HostRuntimeError::Protocol)?;
-                let endpoint_ready = endpoint.map(|address| {
-                    outcome.process_running
-                        && self.runtime.readiness_request(
-                            address,
-                            plan.endpoint_port,
-                            &plan.health_path,
-                        )
-                });
-                let observation = ExactRecipeRunObservation {
-                    schema_version: 1,
-                    node_id: self.client.node_id().to_owned(),
-                    observed_at,
-                    binding: plan.binding,
-                    endpoint_ready,
-                    grant: outcome.grant,
-                    observation_identity_sha256: outcome.observation_identity_sha256,
-                    helper_receipt: outcome.receipt,
-                };
-                self.client
-                    .report_exact_recipe_run_observations(std::slice::from_ref(&observation))
-                    .await?;
-                Ok::<(), RecipeObservationError>(())
+            .map(|plan| {
+                let inspect = &inspect;
+                async move {
+                    let endpoint = plan.endpoint_address;
+                    let outcome = inspect(plan.clone()).await?;
+                    // This timestamp is part of the signed-grant freshness proof.
+                    // Capture it immediately after the local privileged inspection;
+                    // an owner-only HTTP probe follows and remains independently
+                    // bounded to five seconds.
+                    let observed_at =
+                        DateTime::from_timestamp(outcome.receipt.claims.observed_at, 0)
+                            .ok_or(crate::host_runtime::HostRuntimeError::Protocol)?;
+                    let endpoint_ready = endpoint.map(|address| {
+                        outcome.process_running
+                            && self.runtime.readiness_request(
+                                address,
+                                plan.endpoint_port,
+                                &plan.health_path,
+                            )
+                    });
+                    let observation = ExactRecipeRunObservation {
+                        schema_version: 1,
+                        node_id: self.client.node_id().to_owned(),
+                        observed_at,
+                        binding: plan.binding,
+                        endpoint_ready,
+                        grant: outcome.grant,
+                        observation_identity_sha256: outcome.observation_identity_sha256,
+                        helper_receipt: outcome.receipt,
+                    };
+                    self.client
+                        .report_exact_recipe_run_observations(std::slice::from_ref(&observation))
+                        .await?;
+                    Ok::<(), RecipeObservationError>(())
+                }
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
@@ -3348,3 +3370,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "executor/observation_tests.rs"]
+mod observation_tests;
