@@ -1742,7 +1742,13 @@ mod tests {
         let stopping_installation = "db555393-764b-4eb6-8f15-b416d289428f";
         for stopped in [true, false] {
             let data = tempdir().unwrap();
-            let mut value = compiled_plan();
+            // The materialization-only fixture above intentionally gives two
+            // selections the same container target. A retained running plan
+            // needs the Controller's distinct, launchable model mounts.
+            let mut value: Value = serde_json::from_str(include_str!(
+                "../../../../control/tests/fixtures/compiled_workload_v2.json"
+            ))
+            .unwrap();
             value["runtime"]["placement"] = json!({
                 "endpoint_address": "192.168.1.212", "rank": 1, "role": "worker", "world_size": 2,
                 "local_address": "192.168.100.11", "master_address": "192.168.100.10",
