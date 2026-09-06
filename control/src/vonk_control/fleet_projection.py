@@ -787,10 +787,11 @@ class FleetProjection:
                 reason = "installation-not-installed"
             if reason is None and any(node.state != "installed" for node in nodes):
                 reason = "rank-not-installed"
-            if reason is None and any(
-                node.installed_bytes < node.required_bytes for node in nodes
-            ):
-                reason = "rank-incomplete-bytes"
+            # required_bytes is the admission reservation (image, artifacts,
+            # staging, cache and rollback), not an installed artifact target.
+            # The agent verifies artifacts before reporting installed; project
+            # that outcome and exact rank membership without comparing unlike
+            # byte counts. Keep both original receipt values intact.
             present_ranks = [node.rank for node in visible_nodes]
             member_node_ids = sorted(node.node_id for node in visible_nodes)
             for node in visible_nodes:

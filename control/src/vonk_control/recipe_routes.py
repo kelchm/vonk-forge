@@ -939,11 +939,12 @@ class RecipeRouteService:
                         )
             for node in nodes:
                 observed = _aware(node.updated_at)
-                if (
-                    observed > now.astimezone(UTC)
-                    or now.astimezone(UTC) - observed >= self._maximum_age
-                ):
+                if observed > now.astimezone(UTC):
                     raise RecipeRouteError(
+                        "recipe rank readiness evidence is stale", run_id=run.id
+                    )
+                if now.astimezone(UTC) - observed >= self._maximum_age:
+                    raise RecipeRouteNotReady(
                         "recipe rank readiness evidence is stale", run_id=run.id
                     )
                 if (
