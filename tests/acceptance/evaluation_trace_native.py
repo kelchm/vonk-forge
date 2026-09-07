@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 import test_spark_lifecycle as lifecycle
@@ -19,36 +20,51 @@ original = lifecycle.SparkLifecycle._run_synthetic_canary
 def traced_canary(self, node_id):
     if os.environ.get("GITHUB_REPOSITORY") != "kelchm/vonk-forge":
         raise lifecycle.LifecycleError("native trace is restricted to the evaluation fork")
-    pid = subprocess.check_output(
-        ["systemctl", "show", "vonk-forge-package-helper.service", "--property=MainPID", "--value"],
-        text=True, timeout=10,
-    ).strip()
-    if not pid.isdecimal() or int(pid) <= 1:
-        raise lifecycle.LifecycleError("native helper PID unavailable for trace")
+    # The helper is socket-activated: it may still have PID 0 before the
+    # canary's image import. Follow activation while the ordinary flow runs.
     with tempfile.TemporaryDirectory(prefix="vonk-native-stderr-") as directory:
         trace_path = Path(directory) / "stderr.txt"
         with trace_path.open("w") as stream:
-            process = subprocess.Popen(
-                ["sudo", "-n", "strace", "--quiet", "--follow-forks", "--trace=write",
-                 "--trace-fds=2", "--string-limit=2048", "--attach=" + pid],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stream,
-                start_new_session=True,
-            )
+            processes = []
+            stopped = threading.Event()
+
+            def attach():
+                while not stopped.is_set():
+                    probe = subprocess.run(
+                        ["systemctl", "show", "vonk-forge-package-helper.service", "--property=MainPID", "--value"],
+                        capture_output=True, text=True, timeout=10, check=False,
+                    )
+                    pid = probe.stdout.strip()
+                    if probe.returncode == 0 and pid.isdecimal() and int(pid) > 1:
+                        processes.append(subprocess.Popen(
+                            ["sudo", "-n", "strace", "--quiet", "--follow-forks", "--trace=write",
+                             "--trace-fds=2", "--string-limit=2048", "--attach=" + pid],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stream,
+                            start_new_session=True,
+                        ))
+                        return
+                    stopped.wait(0.25)
+
+            thread = threading.Thread(target=attach, daemon=True)
+            thread.start()
             error = None
             try:
                 result = original(self, node_id)
             except lifecycle.LifecycleError as caught:
                 error = caught
             finally:
-                # The sudo/strace process group belongs only to this tracer.
-                subprocess.run(["sudo", "-n", "kill", "-INT", "--", str(-process.pid)],
-                               capture_output=True, timeout=10, check=False)
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    subprocess.run(["sudo", "-n", "kill", "-KILL", "--", str(-process.pid)],
+                stopped.set()
+                thread.join(timeout=15)
+                for process in processes:
+                    # This group contains only our sudo/strace process.
+                    subprocess.run(["sudo", "-n", "kill", "-INT", "--", str(-process.pid)],
                                    capture_output=True, timeout=10, check=False)
-                    process.wait(timeout=5)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        subprocess.run(["sudo", "-n", "kill", "-KILL", "--", str(-process.pid)],
+                                       capture_output=True, timeout=10, check=False)
+                        process.wait(timeout=5)
         if error is not None:
             trace = self._redact_diagnostics(trace_path.read_text(errors="replace"))
             raise lifecycle.LifecycleError(f"{error}\nnative stderr trace (instrumented):\n{trace}") from error
