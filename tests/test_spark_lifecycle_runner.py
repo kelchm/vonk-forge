@@ -1019,6 +1019,8 @@ def test_native_start_failure_retains_bounded_redacted_helper_journal(
 
     def diagnostics(command):
         observed.append(command)
+        if "journalctl" not in command or "vonk-forge-package-helper.service" not in command:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(
             command, 0,
             stdout="discarded" + "x" * 10_000 + f"request rejected: {secret}",
@@ -1031,9 +1033,32 @@ def test_native_start_failure_retains_bounded_redacted_helper_journal(
     assert secret not in result
     assert "request rejected: <redacted>" in result
     assert len(result) < 3_100
-    assert observed == [[
+    assert observed[0] == [
         "sudo", "-n", "journalctl", "--no-pager", "-o", "cat",
         "-n", "80", "-u", "vonk-forge-package-helper.service",
-    ]]
+    ]
     run._diagnostic_command = lambda command: None
     assert run._native_start_failure_diagnostics() == "native helper diagnostics unavailable"
+
+
+def test_native_start_failure_inspects_only_valid_container_ids() -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    identifier = "b" * 64
+    observed = []
+
+    def diagnostics(command):
+        observed.append(command)
+        if command[1] == "ps":
+            output = identifier + "\n--invalid\n"
+        elif command[1:3] == ["container", "inspect"]:
+            output = '{"Status":"created","Error":"OCI runtime create failed"}'
+        else:
+            output = ""
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    run._diagnostic_command = diagnostics
+    result = run._native_start_failure_diagnostics()
+    assert "OCI runtime create failed" in result
+    inspections = [command for command in observed if command[1:3] == ["container", "inspect"]]
+    assert inspections == [["docker", "container", "inspect", "--format", "{{json .State}}", identifier]]

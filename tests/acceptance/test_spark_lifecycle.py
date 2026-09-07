@@ -1055,11 +1055,38 @@ class SparkLifecycle:
                 "-n", "80", "-u", "vonk-forge-package-helper.service",
             ]
         )
+        parts = []
         if result is None or result.returncode != 0:
-            return "native helper diagnostics unavailable"
-        return "native helper diagnostics:\n" + self._redact_diagnostics(
-            result.stdout or result.stderr
-        )[-3_000:]
+            parts.append("native helper diagnostics unavailable")
+        else:
+            parts.append("native helper diagnostics:\n" + self._redact_diagnostics(
+                result.stdout or result.stderr
+            )[-1_500:])
+        # State contains no container environment, command, mounts or labels.
+        # Include created-but-not-started containers, where Docker retains the
+        # actual OCI/CDI failure even though the privileged helper drops stderr.
+        containers = self._diagnostic_command([
+            "docker", "ps", "--all", "--quiet", "--no-trunc",
+            "--filter", "name=^/vonk-",
+        ])
+        if containers is not None and containers.returncode == 0:
+            ids = containers.stdout.splitlines()
+            for container_id in ids[:8]:
+                if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+                    continue
+                state = self._diagnostic_command([
+                    "docker", "container", "inspect", "--format",
+                    "{{json .State}}", container_id,
+                ])
+                if state is not None and state.returncode == 0:
+                    parts.append("container state: " + self._redact_diagnostics(state.stdout)[-1_500:])
+        firewall = self._diagnostic_command([
+            "sudo", "-n", "journalctl", "--no-pager", "-o", "cat",
+            "-n", "30", "-u", "vonk-forge-docker-firewall.service", "-u", "docker.service",
+        ])
+        if firewall is not None and firewall.returncode == 0:
+            parts.append("Docker and firewall journal:\n" + self._redact_diagnostics(firewall.stdout)[-2_000:])
+        return "\n".join(parts)
 
     def _cleanup(self) -> None:
         failures: list[BaseException] = []
