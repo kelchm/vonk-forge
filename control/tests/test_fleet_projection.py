@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from vonk_control.fleet_projection import (
     RecipePresence,
     TelemetryDetails,
     TelemetryPoint,
+    telemetry_point,
 )
 from vonk_control.models import (
     AgentCertificate,
@@ -38,6 +40,13 @@ from vonk_control.models import (
     RecipeRun,
     ResourceReservation,
     RunNode,
+)
+from vonk_control.telemetry import TelemetryDetailsInput, TelemetrySampleView
+from vonk_control.telemetry_contract import (
+    TelemetryCapability,
+    TelemetryMetrics,
+    TelemetryProvenance,
+    TelemetrySeries,
 )
 from vonk_forge_contracts import ModelDefinition, RecipeDefinition, content_sha256
 
@@ -798,6 +807,134 @@ def test_fleet_telemetry_dto_rejects_nil_and_noncanonical_boot_ids(
             details=TelemetryDetails(),
             metrics=telemetry_metrics_document(),
         )
+
+
+def test_telemetry_point_overlays_identity_on_frozen_series_and_capabilities() -> None:
+    """Regression: the wire models are frozen, so the overlay must copy.
+
+    A producer embedding a foreign node identity or receipt time in its
+    report must be overridden by the authenticated identity and Controller
+    receipt time, without mutating the persisted source metrics.
+    """
+
+    spoofed_node = "spk_" + "e" * 32
+    spoofed_received = NOW - timedelta(days=30)
+    received_at = NOW + timedelta(milliseconds=250)
+    source_series = TelemetrySeries(
+        node_id=spoofed_node,
+        key="cpu.utilization",
+        scope="node",
+        value=12.5,
+        unit="percent",
+        source="procfs",
+        measurement_kind="measured",
+        observed_at=NOW,
+        received_at=spoofed_received,
+        freshness_threshold_seconds=30.0,
+        support_status="available",
+        aggregation="gauge",
+    )
+    anonymous_series = TelemetrySeries(
+        key="gpu.utilization",
+        scope="accelerator",
+        device_id="gpu0",
+        value=40,
+        unit="percent",
+        source="nvml",
+        measurement_kind="measured",
+        observed_at=NOW,
+        freshness_threshold_seconds=30.0,
+        support_status="available",
+        aggregation="gauge",
+    )
+    source_capability = TelemetryCapability(
+        node_id=spoofed_node,
+        key="cpu.utilization",
+        scope="node",
+        unit="percent",
+        source="procfs",
+        measurement_kind="measured",
+        supported=True,
+        freshness_threshold_seconds=30.0,
+    )
+    anonymous_capability = TelemetryCapability(
+        key="power.draw",
+        scope="node",
+        unit="watt",
+        source="hwmon",
+        measurement_kind="measured",
+        supported=False,
+        freshness_threshold_seconds=30.0,
+        reason="no power sensor",
+    )
+    metrics = TelemetryMetrics(
+        schema_version=2,
+        series=[source_series, anonymous_series],
+        capabilities=[source_capability, anonymous_capability],
+        runtimes=[],
+        workloads=[],
+        provenance=TelemetryProvenance(collector="test", collector_version="1"),
+    )
+    source_document = metrics.model_dump(mode="json")
+    sample = TelemetrySampleView(
+        id="00000000-0000-4000-8000-000000000004",
+        node_id=NODE_A,
+        boot_id=uuid.UUID(NON_RFC_BOOT_ID),
+        sequence=7,
+        observed_at=NOW,
+        received_at=received_at,
+        cpu_utilization_percent=12.5,
+        load_average_1m=None,
+        memory_total_bytes=None,
+        memory_available_bytes=None,
+        disk_total_bytes=None,
+        disk_free_bytes=None,
+        gpu_utilization_percent=None,
+        gpu_memory_total_bytes=None,
+        gpu_memory_free_bytes=None,
+        temperature_c=None,
+        power_watts=None,
+        network_receive_bytes_per_second=None,
+        network_transmit_bytes_per_second=None,
+        gap_samples=0,
+        details=TelemetryDetailsInput(),
+        metrics=metrics,
+    )
+
+    point = telemetry_point(sample)
+
+    assert point.node_id == NODE_A
+    assert point.received_at == received_at
+    assert [item.node_id for item in point.metrics.series] == [NODE_A, NODE_A]
+    assert [item.received_at for item in point.metrics.series] == [
+        received_at,
+        received_at,
+    ]
+    assert [item.node_id for item in point.metrics.capabilities] == [NODE_A, NODE_A]
+    # Everything other than the overlaid identity is carried through intact.
+    assert [item.key for item in point.metrics.series] == [
+        "cpu.utilization",
+        "gpu.utilization",
+    ]
+    assert [item.value for item in point.metrics.series] == [12.5, 40]
+    assert [item.key for item in point.metrics.capabilities] == [
+        "cpu.utilization",
+        "power.draw",
+    ]
+    assert point.metrics.capabilities[1].reason == "no power sensor"
+    assert point.metrics.provenance == metrics.provenance
+    # The mapping view used by canonical serialization exposes the overlay.
+    assert dict(point.metrics.series[1])["node_id"] == NODE_A
+    assert dict(point.metrics.series[1])["received_at"] == received_at
+    # The persisted source sample is immutable and remains as reported.
+    assert sample.metrics is metrics
+    assert metrics.model_dump(mode="json") == source_document
+    assert source_series.node_id == spoofed_node
+    assert source_series.received_at == spoofed_received
+    assert anonymous_series.node_id is None
+    assert anonymous_series.received_at is None
+    assert source_capability.node_id == spoofed_node
+    assert anonymous_capability.node_id is None
 
 
 def test_projection_schema_is_finite_for_states_items_and_task3_numbers() -> None:
