@@ -23,6 +23,127 @@ def _module():
     return module
 
 
+@pytest.mark.parametrize("secret", ["disposable-provider-secret", 'quote"slash\\unicode\N{SNOWMAN}'])
+def test_failed_canary_run_switch_keeps_phase_receipt_and_redacts_secrets(
+    monkeypatch: pytest.MonkeyPatch, secret: str,
+) -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    parent = "00000000-0000-4000-8000-000000000001"
+    child = "00000000-0000-4000-8000-000000000002"
+    node = "spk_" + "a" * 32
+    monkeypatch.setenv("VONK_ACCEPTANCE_LITELLM_UPSTREAM_KEY", secret)
+    calls = []
+
+    def request(method, path):
+        calls.append((method, path))
+        return 200, {
+            "id": child,
+            "kind": "recipe.start",
+            "state": "failed",
+            "nodes": [node],
+            "result": {
+                "node_evidence": {node: {"reason": f"helper rejected {secret}"}},
+            },
+        }
+
+    run.control = SimpleNamespace(request=request)
+    operation = {
+        "operation_id": parent,
+        "state": "failed",
+        "current_phase": "start",
+        "status_reason": "run-switch phase operation failed: failed",
+        "result": {"child_operation_id": child, "subphase": None},
+    }
+    with pytest.raises(lifecycle.LifecycleError) as raised:
+        run._await_canary_run_switch(operation, expected_phases=[], label="canary")
+
+    message = str(raised.value)
+    assert "run-switch phase operation failed: failed" in message
+    assert '"phase": "start"' in message
+    assert "helper rejected <redacted>" in message
+    assert secret not in message
+    assert json.dumps(secret)[1:-1] not in message
+    assert node in message
+    assert calls == [("GET", f"/api/v1/recipes/operations/{child}")]
+
+
+@pytest.mark.parametrize("child_id", [None, "../../unrelated"])
+def test_canary_failure_does_not_follow_invalid_child_ids(child_id) -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+
+    def request(*args):
+        pytest.fail("Invalid child identity must not be requested")
+
+    run.control = SimpleNamespace(request=request)
+    details = json.loads(run._canary_run_switch_failure_evidence({
+        "current_phase": "prepare", "result": {"child_operation_id": child_id},
+    }))
+    assert details["phase"] == "prepare"
+    assert "child" not in details
+
+
+def test_canary_failure_lookup_error_preserves_original_failure() -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+
+    def request(*args):
+        raise lifecycle.SliceError("diagnostic endpoint unavailable")
+
+    run.control = SimpleNamespace(request=request)
+    operation = {
+        "operation_id": "00000000-0000-4000-8000-000000000001",
+        "state": "failed",
+        "status_reason": "original phase failure",
+        "result": {"child_operation_id": "00000000-0000-4000-8000-000000000002"},
+    }
+    with pytest.raises(lifecycle.LifecycleError, match="original phase failure") as raised:
+        run._await_canary_run_switch(operation, expected_phases=[], label="canary")
+    assert '"child_lookup_error": "SliceError"' in str(raised.value)
+
+
+def test_canary_phase_mismatch_reports_expected_and_actual_phases() -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    run.control = SimpleNamespace(request=lambda *args: pytest.fail("No child to fetch"))
+    operation = {
+        "operation_id": "00000000-0000-4000-8000-000000000001",
+        "state": "succeeded",
+        "completed_phases": ["prepare"],
+        "result": {"child_operation_id": None},
+    }
+    with pytest.raises(lifecycle.LifecycleError) as raised:
+        run._await_canary_run_switch(operation, expected_phases=["final_verify"], label="canary")
+    assert '"completed_phases": ["prepare"]' in str(raised.value)
+    assert '"expected_phases": ["final_verify"]' in str(raised.value)
+
+
+def test_canary_timeout_retains_the_pending_phase_receipt(monkeypatch: pytest.MonkeyPatch) -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    child = "00000000-0000-4000-8000-000000000002"
+    calls = []
+
+    def request(method, path):
+        calls.append((method, path))
+        return 200, {"id": child, "kind": "recipe.build.v1", "state": "running", "result": None}
+
+    run.control = SimpleNamespace(request=request)
+    clock = iter([0, 301])
+    monkeypatch.setattr(lifecycle.time, "monotonic", lambda: next(clock))
+    operation = {
+        "operation_id": "00000000-0000-4000-8000-000000000001",
+        "state": "running",
+        "current_phase": "prepare",
+        "result": {"child_operation_id": child, "subphase": "container-build"},
+    }
+    with pytest.raises(lifecycle.LifecycleError, match="did not converge") as raised:
+        run._await_canary_run_switch(operation, expected_phases=[], label="canary")
+    assert '"subphase": "container-build"' in str(raised.value)
+    assert calls == [("GET", f"/api/v1/recipes/operations/{child}")]
+
+
 def test_literal_spark_bootstrap_keeps_pairing_token_only_in_tty_answers(
     tmp_path: Path,
 ) -> None:

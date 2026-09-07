@@ -2187,7 +2187,7 @@ class SparkLifecycle:
                 plan_digest=uninstall_digest,
             )
             completed.append("uninstalled")
-        except (SliceError, ServingExecutionError) as error:
+        except (SliceError, ServingExecutionError, LifecycleError) as error:
             # Keep the API response concise for the lifecycle client, but make
             # the bounded Controller logs available before cleanup.  This is
             # the only useful evidence for an unexpected 5xx from a fresh
@@ -2231,7 +2231,10 @@ class SparkLifecycle:
         deadline = time.monotonic() + 300
         while operation.get("state") in {"queued", "running"}:
             if time.monotonic() >= deadline:
-                raise LifecycleError(f"{label} did not converge")
+                raise LifecycleError(
+                    f"{label} did not converge; "
+                    + self._canary_run_switch_failure_evidence(operation, expected_phases)
+                )
             time.sleep(1)
             _, payload = self.control.request(
                 "GET", f"/api/v1/recipes/run-switches/{operation_id}"
@@ -2243,9 +2246,53 @@ class SparkLifecycle:
         ):
             reason = operation.get("status_reason")
             raise LifecycleError(
-                f"{label} failed: {reason if isinstance(reason, str) else 'incomplete evidence'}"
+                f"{label} failed: {reason if isinstance(reason, str) else 'incomplete evidence'}; "
+                + self._canary_run_switch_failure_evidence(operation, expected_phases)
             )
         return operation
+
+    def _canary_run_switch_failure_evidence(
+        self, operation: dict[str, object], expected_phases: list[object] | None = None
+    ) -> str:
+        """Retain the failed phase's receipt before disposable cleanup."""
+        assert self.control is not None
+        result = operation.get("result")
+        result = result if isinstance(result, dict) else {}
+        details: dict[str, object] = {
+            "operation_id": operation.get("operation_id"),
+            "state": operation.get("state"),
+            "completed_phases": operation.get("completed_phases"),
+            "expected_phases": expected_phases,
+            "phase": operation.get("current_phase"),
+            "subphase": result.get("subphase"),
+            "child_operation_id": result.get("child_operation_id"),
+        }
+        child_id = result.get("child_operation_id")
+        if isinstance(child_id, str) and UUID.fullmatch(child_id) is not None:
+            try:
+                _, payload = self.control.request(
+                    "GET", f"/api/v1/recipes/operations/{child_id}"
+                )
+                child = require_object(payload, "failed canary phase operation")
+                details["child"] = {
+                    name: child.get(name)
+                    for name in ("id", "kind", "state", "nodes", "result")
+                }
+            except (SliceError, ServingExecutionError) as error:
+                # Diagnostics must not replace the original lifecycle failure.
+                details["child_lookup_error"] = type(error).__name__
+        def redact(value):
+            if isinstance(value, str):
+                return self._redact_diagnostics(value)
+            if isinstance(value, dict):
+                return {redact(key): redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        # Redact before JSON escaping, which otherwise hides quotes/backslashes
+        # in secret values from the existing literal-value scrubber.
+        return json.dumps(redact(details), sort_keys=True)[-8_000:]
 
     def _await_canary_recipe_operation(
         self,
