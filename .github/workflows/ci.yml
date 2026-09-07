@@ -1541,11 +1541,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Resolve exact canonical recipe library source
+        id: evaluation-recipe-library-source
+        run: |
+          set -euo pipefail
+          revision=$(cat tests/acceptance/recipe-library-revision.txt)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          test "$(awk 'END { print NR }' tests/acceptance/recipe-library-revision.txt)" = 1
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
       - name: Check out exact published canary library
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: CarstVaartjes/vonk-forge-recipes
-          ref: d55389b5cc144d0483cf89b95770198c6125cb15
+          ref: ${{ steps.evaluation-recipe-library-source.outputs.revision }}
           path: .recipe-library
           persist-credentials: false
       - name: Install uv and Python
@@ -1559,8 +1567,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          test "$(cat tests/acceptance/recipe-library-revision.txt)" = d55389b5cc144d0483cf89b95770198c6125cb15
-          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = d55389b5cc144d0483cf89b95770198c6125cb15
+          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = "$(cat tests/acceptance/recipe-library-revision.txt)"
           gh run download 34165149370 --repo CarstVaartjes/vonk-forge \
             --name installer-candidate-dev-fc2f54c476cf6f158656d6744b40d6dbd24fcdad529a2b21cf54a87151c05af9 \
             --dir "$RUNNER_TEMP/spark-publication"

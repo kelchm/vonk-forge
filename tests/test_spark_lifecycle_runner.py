@@ -1005,3 +1005,35 @@ def test_running_channel_alias_must_match_the_candidate(
     else:
         with pytest.raises(lifecycle.LifecycleError, match="differs from publication"):
             run._assert_running_publication_images()
+
+
+def test_native_start_failure_retains_bounded_redacted_helper_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    run.bundle = tmp_path
+    secret = "sensitive-provider-value"
+    monkeypatch.setenv("VONK_ACCEPTANCE_LITELLM_UPSTREAM_KEY", secret)
+    observed = []
+
+    def diagnostics(command):
+        observed.append(command)
+        return subprocess.CompletedProcess(
+            command, 0,
+            stdout="discarded" + "x" * 10_000 + f"request rejected: {secret}",
+            stderr="",
+        )
+
+    run._diagnostic_command = diagnostics
+    result = run._native_start_failure_diagnostics()
+    assert "discarded" not in result
+    assert secret not in result
+    assert "request rejected: <redacted>" in result
+    assert len(result) < 3_100
+    assert observed == [[
+        "sudo", "-n", "journalctl", "--no-pager", "-o", "cat",
+        "-n", "80", "-u", "vonk-forge-package-helper.service",
+    ]]
+    run._diagnostic_command = lambda command: None
+    assert run._native_start_failure_diagnostics() == "native helper diagnostics unavailable"

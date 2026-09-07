@@ -1045,6 +1045,22 @@ class SparkLifecycle:
             f"{stage} failed; {diagnostics or 'installer diagnostics unavailable'}"
         )
 
+    def _native_start_failure_diagnostics(self) -> str:
+        # The official helper deliberately omits raw command stderr from its
+        # wire response. Its bounded rejection journal is still available on
+        # this disposable host before package cleanup removes the services.
+        result = self._diagnostic_command(
+            [
+                "sudo", "-n", "journalctl", "--no-pager", "-o", "cat",
+                "-n", "80", "-u", "vonk-forge-package-helper.service",
+            ]
+        )
+        if result is None or result.returncode != 0:
+            return "native helper diagnostics unavailable"
+        return "native helper diagnostics:\n" + self._redact_diagnostics(
+            result.stdout or result.stderr
+        )[-3_000:]
+
     def _cleanup(self) -> None:
         failures: list[BaseException] = []
         if _agent_package_installed():
@@ -2192,7 +2208,9 @@ class SparkLifecycle:
             # the bounded Controller logs available before cleanup.  This is
             # the only useful evidence for an unexpected 5xx from a fresh
             # candidate and uses the existing secret redaction path.
-            raise self._installation_failure("synthetic canary", error) from error
+            native = self._native_start_failure_diagnostics()
+            detail = LifecycleError(f"{native}\n{error}")
+            raise self._installation_failure("synthetic canary", detail) from error
         if (
             completed != list(SYNTHETIC_CANARY_STATES)
             or not isinstance(response_digest, str)
