@@ -1067,7 +1067,7 @@ class SparkLifecycle:
         # actual OCI/CDI failure even though the privileged helper drops stderr.
         containers = self._diagnostic_command([
             "docker", "ps", "--all", "--quiet", "--no-trunc",
-            "--filter", "name=^/vonk-",
+            "--filter", "label=ai.vonkforge.managed=true",
         ])
         if containers is not None and containers.returncode == 0:
             ids = containers.stdout.splitlines()
@@ -1076,7 +1076,7 @@ class SparkLifecycle:
                     continue
                 state = self._diagnostic_command([
                     "docker", "container", "inspect", "--format",
-                    "{{json .State}}", container_id,
+                    '{{json .State.Status}} {{json .State.Error}} {{json .State.ExitCode}}', container_id,
                 ])
                 if state is not None and state.returncode == 0:
                     parts.append("container state: " + self._redact_diagnostics(state.stdout)[-1_500:])

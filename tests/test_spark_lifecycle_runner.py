@@ -1061,4 +1061,4 @@ def test_native_start_failure_inspects_only_valid_container_ids() -> None:
     result = run._native_start_failure_diagnostics()
     assert "OCI runtime create failed" in result
     inspections = [command for command in observed if command[1:3] == ["container", "inspect"]]
-    assert inspections == [["docker", "container", "inspect", "--format", "{{json .State}}", identifier]]
+    assert inspections == [["docker", "container", "inspect", "--format", '{{json .State.Status}} {{json .State.Error}} {{json .State.ExitCode}}', identifier]]

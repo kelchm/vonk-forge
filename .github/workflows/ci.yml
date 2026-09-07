@@ -1588,6 +1588,10 @@ jobs:
           sudo install -D -o root -g root -m 0644 "$updated_config" "$daemon_config"
           sudo systemctl restart docker.service
           docker info --format '{{json .CDISpecDirs}}' | jq -e 'index("/etc/cdi") != null and index("/var/run/cdi") != null' >/dev/null
+      - name: Install bounded native diagnostic tracer
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y strace
       - name: Run official package and image lifecycle
         run: |
           set -euo pipefail
@@ -1600,7 +1604,7 @@ jobs:
             --output "$RUNNER_TEMP/accepted-compose-overlay.yml"
           export VONK_ACCEPTANCE_COMPOSE_OVERLAY="$RUNNER_TEMP/accepted-compose-overlay.yml"
           uv run --with-editable "$VONK_RECIPE_LIBRARY_ROOT/contracts" \
-            python tests/acceptance/test_spark_lifecycle.py run \
+            python tests/acceptance/evaluation_trace_native.py run \
             --candidate-release "$release_root/release.json" \
             --baseline-release "$release_root/acceptance-baseline/release.json" \
             --object-root "$RUNNER_TEMP/spark-publication/installer-publication/objects" \
