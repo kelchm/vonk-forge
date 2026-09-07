@@ -1514,3 +1514,98 @@ jobs:
           r2_secret_access_key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           r2_apt_public_bucket: ${{ vars.R2_APT_PUBLIC_BUCKET }}
           r2_apt_state_bucket: ${{ vars.R2_APT_STATE_BUCKET }}
+
+  evaluation-spark-546:
+    name: Qualify official .546 Spark lifecycle in disposable ARM64 runner
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
+      VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
+      INSTALLER_PUBLIC_ORIGIN: https://install.vonkforge.ai
+      VONK_ACCEPTANCE_CHANNEL: dev
+      VONK_ACCEPTANCE_GENERATION: fc2f54c476cf6f158656d6744b40d6dbd24fcdad529a2b21cf54a87151c05af9
+      VONK_ACCEPTANCE_PLATFORM: linux-arm64
+      VONK_ACCEPTANCE_SPARK_CONTROLLER_BOUNDARY: loopback
+      VONK_ACCEPTANCE_SOURCE_SHA: fb2626a00e545138dda6393005490ae73e763014
+      VONK_ACCEPTANCE_VERSION: 0.1.1~dev.546+gc34ef50ac1df
+      VONK_ACCEPTANCE_WORKSPACE: ${{ github.workspace }}
+      # Canary requests use the fixture's local route; no hosted provider is called.
+      VONK_ACCEPTANCE_LITELLM_UPSTREAM_KEY: unused-synthetic-canary-only
+    steps:
+      - name: Check out signed evaluation harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out exact published canary library
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: CarstVaartjes/vonk-forge-recipes
+          ref: d55389b5cc144d0483cf89b95770198c6125cb15
+          path: .recipe-library
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.1"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Fetch exact official immutable candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(cat tests/acceptance/recipe-library-revision.txt)" = d55389b5cc144d0483cf89b95770198c6125cb15
+          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = d55389b5cc144d0483cf89b95770198c6125cb15
+          gh run download 34165149370 --repo CarstVaartjes/vonk-forge \
+            --name installer-candidate-dev-fc2f54c476cf6f158656d6744b40d6dbd24fcdad529a2b21cf54a87151c05af9 \
+            --dir "$RUNNER_TEMP/spark-publication"
+      - name: Enable CDI on the disposable runner
+        run: |
+          set -euo pipefail
+          daemon_config=/etc/docker/daemon.json
+          updated_config=$(mktemp)
+          trap 'rm -f -- "$updated_config"' EXIT
+          if sudo test -e "$daemon_config"; then
+            # Root reads the existing config; the output is an unprivileged temporary file.
+            # shellcheck disable=SC2024
+            sudo jq 'if (.features // {}) | type != "object" then error("invalid Docker features") else .features = ((.features // {}) + {"cdi": true}) end' "$daemon_config" > "$updated_config"
+          else
+            jq -n '{"features":{"cdi":true}}' > "$updated_config"
+          fi
+          sudo dockerd --validate --config-file "$updated_config"
+          sudo install -D -o root -g root -m 0644 "$updated_config" "$daemon_config"
+          sudo systemctl restart docker.service
+          docker info --format '{{json .CDISpecDirs}}' | jq -e 'index("/etc/cdi") != null and index("/var/run/cdi") != null' >/dev/null
+      - name: Run official package and image lifecycle
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/spark-acceptance"
+          release_root="$RUNNER_TEMP/spark-publication/installer-publication/objects/artifacts/dev/releases/$VONK_ACCEPTANCE_GENERATION"
+          scripts/render-accepted-compose-overlay \
+            --release "$release_root/release.json" --signature "$release_root/release.sig" \
+            --public-key install/installer-release-public.pem --channel dev \
+            --generation "$VONK_ACCEPTANCE_GENERATION" \
+            --output "$RUNNER_TEMP/accepted-compose-overlay.yml"
+          export VONK_ACCEPTANCE_COMPOSE_OVERLAY="$RUNNER_TEMP/accepted-compose-overlay.yml"
+          uv run --with-editable "$VONK_RECIPE_LIBRARY_ROOT/contracts" \
+            python tests/acceptance/test_spark_lifecycle.py run \
+            --candidate-release "$release_root/release.json" \
+            --baseline-release "$release_root/acceptance-baseline/release.json" \
+            --object-root "$RUNNER_TEMP/spark-publication/installer-publication/objects" \
+            --channel dev --version "$VONK_ACCEPTANCE_VERSION" \
+            --source-sha "$VONK_ACCEPTANCE_SOURCE_SHA" --generation "$VONK_ACCEPTANCE_GENERATION" \
+            --run-id "$GITHUB_RUN_ID" --platform linux-arm64 \
+            --output "$RUNNER_TEMP/spark-acceptance/report-linux-arm64.json"
+      - name: Retain bounded lifecycle proof if produced
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evaluation-spark-546-proof
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}/spark-acceptance/report-linux-arm64.json
