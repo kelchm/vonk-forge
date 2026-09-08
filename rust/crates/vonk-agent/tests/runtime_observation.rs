@@ -292,3 +292,57 @@ fn retained_job_stop_accepts_only_a_timeout_within_installed_limit() {
     .unwrap();
     assert!(runtime.prepare_stop(RUN).is_err());
 }
+
+#[test]
+fn production_dual_rank_shapes_retain_endpoint_ownership_and_serving_ports() {
+    for owner in [false, true] {
+        let root = tempdir().unwrap();
+        let mut plan = schema2_dual_plan();
+        if owner {
+            plan.topology.rank = 0;
+            plan.topology.role = "entrypoint".into();
+            plan.runtime.placement.rank = 0;
+            plan.runtime.placement.role = "entrypoint".into();
+            plan.runtime.placement.local_address = plan.runtime.placement.master_address;
+        } else {
+            plan.runtime.placement.endpoint_address = None;
+        }
+        plan.validate().unwrap();
+        persist_plan(root.path(), &plan);
+        let runtime = OciRuntime {
+            runner: &NoProcess,
+            data_root: root.path(),
+            huggingface_curl_config: None,
+        };
+        let launched = runtime
+            .prepare_start_with_inspection_identity(
+                &plan,
+                INSTALLATION,
+                RUN,
+                &placement(&plan),
+                &identity(&plan),
+            )
+            .unwrap();
+        let inspections = runtime.recipe_run_inspection_plans().unwrap();
+        assert_eq!(inspections.len(), 1);
+        assert_eq!(
+            inspections[0].endpoint_address,
+            plan.runtime.placement.endpoint_address
+        );
+        assert_eq!(inspections[0].endpoint_port, 8000);
+        assert_eq!(inspections[0].binding.port, 8000);
+        assert_eq!(&inspections[0].arguments[4..], launched.main.as_slice());
+        if !owner {
+            let lifecycle = root
+                .path()
+                .join("run-metadata")
+                .join(RUN)
+                .join("lifecycle.json");
+            let mut altered: Value =
+                serde_json::from_slice(&fs::read(&lifecycle).unwrap()).unwrap();
+            altered["placement"]["endpoint_address"] = json!(plan.runtime.placement.local_address);
+            fs::write(&lifecycle, serde_json::to_vec(&altered).unwrap()).unwrap();
+            assert!(runtime.recipe_run_inspection_plans().is_err());
+        }
+    }
+}
