@@ -1,6 +1,8 @@
 name: Local evaluation Controller images and setup programs
 
 on:
+  push:
+    branches: [patch/evaluation-current-release]
   workflow_dispatch:
 
 permissions:

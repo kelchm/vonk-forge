@@ -15,12 +15,12 @@ def workflow_job(text: str, job_name: str) -> str:
     return body if next_job is None else body[: next_job.start()]
 
 
-def test_evaluation_workflow_is_manual_fork_only() -> None:
+def test_evaluation_workflow_is_scoped_to_the_evaluation_fork() -> None:
     text = WORKFLOW.read_text()
 
     assert text.startswith("name: Fork evaluation native package\n")
-    assert "on:\n  workflow_dispatch:\n" in text
-    assert "push:" not in text
+    assert "  workflow_dispatch:\n" in text
+    assert "  push:\n    branches: [patch/evaluation-current-release]\n" in text
     assert "pull_request:" not in text
     assert "workflow_call:" not in text
     assert "workflow_run:" not in text
@@ -89,6 +89,8 @@ def test_evaluation_workflow_compiles_native_arm64_with_pinned_toolchain() -> No
     assert "--package vonk-spark-setup --package vonk-nas-setup" in compile_job
     assert "scripts/materialize-agent-tools --output-root target" in compile_job
     assert "scripts/verify-agent-binaries" in compile_job
+    assert "compiled/binaries/vonk-runtime-probe" in compile_job
+    assert "prebuilt/binaries/vonk-runtime-probe" in sign
     assert (
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
         in compile_job

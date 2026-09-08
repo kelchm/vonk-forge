@@ -1,5 +1,7 @@
 name: Local evaluation native canary
 on:
+  push:
+    branches: [patch/evaluation-current-release]
   workflow_dispatch:
     inputs:
       bundle_tag:
@@ -14,7 +16,7 @@ permissions:
   contents: read
 jobs:
   canary:
-    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-')
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-')
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:

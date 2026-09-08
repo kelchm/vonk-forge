@@ -1,6 +1,8 @@
 name: Fork evaluation native package
 
 on:
+  push:
+    branches: [patch/evaluation-current-release]
   workflow_dispatch:
 
 permissions:
@@ -182,6 +184,7 @@ jobs:
             "target/$target/release/vonk-agent" \
             "target/$target/release/vonk-agent-helper" \
             "target/$target/release/vonk-build-egress" \
+            "target/$target/release/vonk-runtime-probe" \
             "$staged/binaries/"
           scripts/verify-agent-binaries \
             --architecture linux-arm64 \
@@ -224,6 +227,7 @@ jobs:
             ${{ runner.temp }}/compiled/binaries/vonk-agent
             ${{ runner.temp }}/compiled/binaries/vonk-agent-helper
             ${{ runner.temp }}/compiled/binaries/vonk-build-egress
+            ${{ runner.temp }}/compiled/binaries/vonk-runtime-probe
             ${{ runner.temp }}/compiled/tools/oras
             ${{ runner.temp }}/compiled/tools/oras.LICENSE
             ${{ runner.temp }}/compiled/setup/vonk-nas-setup
@@ -290,6 +294,7 @@ jobs:
             prebuilt/binaries/vonk-agent \
             prebuilt/binaries/vonk-agent-helper \
             prebuilt/binaries/vonk-build-egress \
+            prebuilt/binaries/vonk-runtime-probe \
             prebuilt/setup/SHA256SUMS \
             prebuilt/setup/vonk-nas-setup \
             prebuilt/setup/vonk-spark-setup \
@@ -322,6 +327,7 @@ jobs:
             prebuilt/binaries/vonk-agent \
             prebuilt/binaries/vonk-agent-helper \
             prebuilt/binaries/vonk-build-egress \
+            prebuilt/binaries/vonk-runtime-probe \
             prebuilt/tools/oras \
             "$RUNNER_TEMP/package-binaries/"
           install -m 0444 prebuilt/tools/oras.LICENSE \
