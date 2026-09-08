@@ -1897,63 +1897,77 @@ class ModelCacheService:
         stream, effective_offset, close = self._open_source(spec, offset)
         if effective_offset != offset:
             received = effective_offset
+        durable_received = received
         try:
             mode = "ab" if effective_offset else "wb"
             with part.open(mode) as output:
-                while True:
-                    if self._closed.is_set():
-                        self._checkpoint_artifact(
-                            spec,
-                            operation_id=operation_id,
-                            set_digest=set_digest,
-                            actual_bytes=received,
-                            state="partial",
-                            completed_artifacts=completed_artifacts,
-                        )
-                        raise InterruptedError("model cache service is shutting down")
-                    if hasattr(stream, "read"):
-                        chunk = stream.read(_CHUNK_BYTES)
-                    else:
-                        chunk = next(stream, b"")
-                    if not chunk:
-                        break
-                    if not isinstance(chunk, bytes):
-                        chunk = bytes(chunk)
-                    received += len(chunk)
-                    if received > spec.expected_bytes:
-                        raise ModelCacheStorageError(
-                            "model_cache.source_size_mismatch",
-                            "source returned more bytes than the immutable artifact pin",
-                            recovery="download_again",
-                        )
-                    output.write(chunk)
+                synced_at = time.monotonic()
+
+                def sync_received() -> None:
+                    nonlocal durable_received, synced_at
                     output.flush()
                     os.fsync(output.fileno())
-                    if interrupt_after_bytes is not None and received >= interrupt_after_bytes:
-                        self._checkpoint_artifact(
-                            spec,
-                            operation_id=operation_id,
-                            set_digest=set_digest,
-                            actual_bytes=received,
-                            state="partial",
-                            completed_artifacts=completed_artifacts,
-                        )
-                        raise InterruptedError("download interrupted at a durable checkpoint")
-                    self._checkpoint_artifact(
-                        spec,
-                        operation_id=operation_id,
-                        set_digest=set_digest,
-                        actual_bytes=received,
-                        state="partial",
-                        completed_artifacts=completed_artifacts,
-                        force_progress=False,
-                    )
+                    durable_received = received
+                    synced_at = time.monotonic()
+
+                try:
+                    while True:
+                        if self._closed.is_set():
+                            sync_received()
+                            self._checkpoint_artifact(
+                                spec, operation_id=operation_id, set_digest=set_digest,
+                                actual_bytes=durable_received, state="partial",
+                                completed_artifacts=completed_artifacts,
+                            )
+                            raise InterruptedError("model cache service is shutting down")
+                        if hasattr(stream, "read"):
+                            chunk = stream.read(_CHUNK_BYTES)
+                        else:
+                            chunk = next(stream, b"")
+                        if not chunk:
+                            break
+                        if not isinstance(chunk, bytes):
+                            chunk = bytes(chunk)
+                        next_received = received + len(chunk)
+                        if next_received > spec.expected_bytes:
+                            raise ModelCacheStorageError(
+                                "model_cache.source_size_mismatch",
+                                "source returned more bytes than the immutable artifact pin",
+                                recovery="download_again",
+                            )
+                        output.write(chunk)
+                        received = next_received
+                        if interrupt_after_bytes is not None and received >= interrupt_after_bytes:
+                            sync_received()
+                            self._checkpoint_artifact(
+                                spec, operation_id=operation_id, set_digest=set_digest,
+                                actual_bytes=durable_received, state="partial",
+                                completed_artifacts=completed_artifacts,
+                            )
+                            raise InterruptedError("download interrupted at a durable checkpoint")
+                        # Keep reading individual network fragments so shutdown is
+                        # observed promptly; batch only durable disk/DB work. The
+                        # file object's bounded buffer avoids another model buffer.
+                        if (received - durable_received >= _CHUNK_BYTES
+                            or time.monotonic() - synced_at >= 1):
+                            sync_received()
+                            self._checkpoint_artifact(
+                                spec, operation_id=operation_id, set_digest=set_digest,
+                                actual_bytes=durable_received, state="partial",
+                                completed_artifacts=completed_artifacts, force_progress=False,
+                            )
+                except (OSError, httpx.HTTPError, ModelCacheError):
+                    # Preserve even a sub-MiB tail when a source fails. Never
+                    # publish its byte count until the sync has succeeded.
+                    if received > durable_received:
+                        sync_received()
+                    raise
+                if received > durable_received:
+                    sync_received()
         except (OSError, httpx.HTTPError, ModelCacheError):
-            # Flush the last received counter when a stream fails between the
-            # regular one-second samples; resumable bytes are already on disk.
             self._checkpoint_artifact(
                 spec, operation_id=operation_id, set_digest=set_digest,
-                actual_bytes=part.stat().st_size, state="partial",
+                actual_bytes=durable_received, state="partial",
                 completed_artifacts=completed_artifacts,
             )
             raise
@@ -2067,7 +2081,7 @@ class ModelCacheService:
                     "model_cache.range_invalid", "cache source returned an invalid byte range"
                 )
         return (
-            response.iter_bytes(chunk_size=_CHUNK_BYTES),
+            response.iter_bytes(),
             effective_offset,
             lambda: (response.close(), client.close() if owns_client else None),
         )
@@ -2262,6 +2276,12 @@ class ModelCacheService:
                 last = self._progress_checkpoint_at.get(operation_id)
                 if last is not None and 0 <= (now - last).total_seconds() < 1:
                     return
+            # Only the last second is useful to this process-local fast path.
+            # Expire old entries rather than retaining every historical operation.
+            self._progress_checkpoint_at = {
+                key: value for key, value in self._progress_checkpoint_at.items()
+                if 0 <= (now - value).total_seconds() < 1
+            }
             self._progress_checkpoint_at[operation_id] = now
             with self._session(write=True) as session:
                 operation = session.get(ModelCacheOperation, operation_id, with_for_update=True)

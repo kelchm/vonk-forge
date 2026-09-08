@@ -1652,11 +1652,11 @@ def test_fragmented_http_download_bounds_checkpoints(cache, tmp_path: Path, monk
 
 @pytest.mark.parametrize("mode", ["interrupt", "timeout"])
 def test_fragmented_http_final_progress_is_durable_and_resumes(
-    cache, tmp_path: Path, mode: str
+    cache, tmp_path: Path, mode: str, monkeypatch
 ) -> None:
     _existing, sessions = cache
     payload = bytes(range(256)) * ((3 * _CHUNK_BYTES) // 256)
-    durable_after = 2 * _CHUNK_BYTES
+    durable_after = 2 * _CHUNK_BYTES + _CHUNK_BYTES // 2
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1689,6 +1689,26 @@ def test_fragmented_http_final_progress_is_durable_and_resumes(
     service, client = _http_cache_service(
         tmp_path, sessions, handler, clock=lambda: NOW
     )
+    # Check ordering, not merely the eventual size visible in the page cache.
+    import os
+
+    synced_sizes: dict[int, int] = {}
+    real_fsync = os.fsync
+    real_checkpoint = service._checkpoint_artifact
+
+    def synced(fd):
+        result = real_fsync(fd)
+        info = os.fstat(fd)
+        synced_sizes[info.st_ino] = info.st_size
+        return result
+
+    def checked_checkpoint(spec, **kwargs):
+        part = service._partial_path(kwargs["set_digest"], spec.sha256)
+        assert kwargs["actual_bytes"] <= synced_sizes.get(part.stat().st_ino, 0)
+        return real_checkpoint(spec, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", synced)
+    monkeypatch.setattr(service, "_checkpoint_artifact", checked_checkpoint)
     artifact = _http_artifact(payload)
     try:
         preview = service.download_preview(
@@ -1736,6 +1756,44 @@ def test_fragmented_http_final_progress_is_durable_and_resumes(
             / str(artifact["sha256"])[0:2]
             / str(artifact["sha256"])
         ).read_bytes() == payload
+    finally:
+        service.close()
+        client.close()
+
+
+def test_fragmented_http_shutdown_preserves_sub_chunk_tail(cache, tmp_path: Path) -> None:
+    _existing, sessions = cache
+    payload = b"s" * (2 * _CHUNK_BYTES)
+    fragments = []
+
+    class ShutdownStream(httpx.SyncByteStream):
+        def __iter__(self):
+            fragments.append(1)
+            yield payload[:4096]
+            service._closed.set()
+            fragments.append(2)
+            yield payload[4096:8192]
+            raise AssertionError("read another fragment after shutdown")
+
+    def handler(request):
+        return httpx.Response(200, request=request, stream=ShutdownStream())
+
+    service, client = _http_cache_service(tmp_path, sessions, handler)
+    artifact = _http_artifact(payload)
+    try:
+        preview = service.download_preview(model_content_sha256="b" * 64, artifacts=[artifact])
+        operation = service.start_download(
+            actor="test", request_key="00000000-0000-4000-8000-000000000995",
+            plan_digest=preview["plan_digest"], model_content_sha256="b" * 64,
+            artifacts=[artifact],
+        )
+        service.run_pending()
+        observed = service.get_operation(operation.id)
+        assert observed.state == "partial"
+        assert fragments == [1, 2]
+        assert observed.progress["downloaded_bytes"] == 8192
+        part = service._partial_path(observed.artifact_set_sha256, artifact["sha256"])
+        assert part.read_bytes() == payload[:8192]
     finally:
         service.close()
         client.close()
