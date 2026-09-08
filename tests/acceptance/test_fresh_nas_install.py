@@ -233,7 +233,6 @@ def nas_responses(
         "LiteLLM administrator key",
         "Grafana administrator password",
         "Internal agent proxy token",
-        "Internal worker API token",
         "Hermes API key",
     ):
         responses.append((f"{label} (leave blank to generate): ", ""))

@@ -117,7 +117,10 @@ def test_nas_responses_accept_explicit_spark_service_hostnames() -> None:
     ]
 
 
-def test_nas_responses_match_canonical_required_prompt_order(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hermes", [False, True])
+def test_nas_responses_match_canonical_prompt_order(
+    tmp_path: Path, hermes: bool
+) -> None:
     acceptance = _acceptance_module()
     renderer = _script_module(PRODUCTION_RENDERER, "acceptance_prompt_renderer")
     builder = _script_module(PAYLOAD_BUILDER, "acceptance_prompt_payload_builder")
@@ -147,16 +150,41 @@ def test_nas_responses_match_canonical_required_prompt_order(tmp_path: Path) -> 
             label = f"{label} [{default}]"
         canonical_prompts.append(f"{label}: ")
 
+    # The native installer consumes positional answers, including secrets and
+    # the final Hermes selection. One retired prompt shifts every later answer.
+    for item in payload["secrets"]:
+        if item.get("optional", False):
+            continue
+        suffix = " (leave blank to generate)" if item.get("generate_bytes") else ""
+        canonical_prompts.append(f"{item['prompt']}{suffix}: ")
+    for item in payload["generated_secrets"]["random_text"]:
+        canonical_prompts.append(f"{item['prompt']} (leave blank to generate): ")
+    for item in payload["generated_secrets"]["ed25519_pkcs8_pem"]:
+        canonical_prompts.append(
+            f"{item['prompt']} (existing PEM path; leave blank to generate): "
+        )
+    canonical_prompts.append(
+        f"{payload['step_ca_controller']['prompt']} "
+        "(existing bundle secrets directory; leave blank to generate): "
+    )
+    canonical_prompts.append(f"{payload['hermes']['prompt']} [y/N]: ")
+    if hermes:
+        for item in payload["hermes"]["required_values"]:
+            canonical_prompts.append(f"{item['prompt']}: ")
+        for item in payload["hermes"]["secrets"]:
+            suffix = " (leave blank to generate)" if item.get("generate_bytes") else ""
+            canonical_prompts.append(f"{item['prompt']}{suffix}: ")
+
     responses = acceptance.nas_responses(
         nas_ip="192.0.2.10",
         tailnet_suffix="acceptance.example.test",
         oauth_client_id="client-id",
         oauth_client_secret="client-secret",
         upstream_key="upstream-key",
-        hermes=False,
+        hermes=hermes,
     )
 
-    assert [prompt for prompt, _ in responses[: len(required)]] == canonical_prompts
+    assert [prompt for prompt, _ in responses] == canonical_prompts
     assert responses[1] == (
         "Trusted Spark management CIDRs: ",
         "192.168.1.0/24",

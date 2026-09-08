@@ -422,15 +422,28 @@ class TelemetryWorkloadsResponse(_StrictModel):
 
 
 def telemetry_point(value: TelemetrySampleView) -> TelemetryPoint:
-    metrics = value.metrics.model_copy(deep=True)
     # The mTLS identity is authoritative for node ownership.  The receive
     # timestamp is assigned by the Controller, so neither can be spoofed by a
-    # producer embedded in the report.
-    for series in metrics.series:
-        series.node_id = value.node_id
-        series.received_at = value.received_at
-    for capability in metrics.capabilities:
-        capability.node_id = value.node_id
+    # producer embedded in the report.  The wire models are frozen, so the
+    # overlay is applied by copying each item rather than assigning to it,
+    # which also leaves the persisted source sample untouched.
+    source = value.metrics
+    metrics = TelemetryMetrics(
+        schema_version=2,
+        series=[
+            series.model_copy(
+                update={"node_id": value.node_id, "received_at": value.received_at}
+            )
+            for series in source.series
+        ],
+        capabilities=[
+            capability.model_copy(update={"node_id": value.node_id})
+            for capability in source.capabilities
+        ],
+        runtimes=list(source.runtimes),
+        workloads=list(source.workloads),
+        provenance=source.provenance,
+    )
     return TelemetryPoint(
         id=value.id,
         node_id=value.node_id,
