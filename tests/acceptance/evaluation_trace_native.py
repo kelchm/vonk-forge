@@ -20,6 +20,21 @@ original = lifecycle.SparkLifecycle._run_synthetic_canary
 def traced_canary(self, node_id):
     if os.environ.get("GITHUB_REPOSITORY") != "kelchm/vonk-forge":
         raise lifecycle.LifecycleError("native trace is restricted to the evaluation fork")
+    unit_override = Path("/etc/systemd/system/vonk-forge-package-helper.service")
+    apply_unit_fix = os.environ.get("VONK_EVALUATION_CANONICAL_INSTALLATION_ACCESS") == "1"
+    if apply_unit_fix:
+        source = self.workspace / "packaging/systemd/vonk-forge-package-helper.service"
+        addition = ("# Canonical installation projections need runtime-UID ACLs before launch.\n"
+                    "ReadWritePaths=-/var/lib/vonk-forge-agent/installations\n")
+        packaged = Path("/lib/systemd/system/vonk-forge-package-helper.service")
+        if (unit_override.exists() or source.read_text().count(addition) != 1
+                or source.read_text().replace(addition, "") != packaged.read_text()):
+            raise lifecycle.LifecycleError("unit override is not the exact reviewed addition")
+        self._run_command(["sudo", "-n", "install", "-m", "0644", str(source), str(unit_override)], cwd=self.workspace)
+        self._run_command(["sudo", "-n", "systemctl", "daemon-reload"], cwd=self.workspace)
+        self._run_command(["sudo", "-n", "systemctl", "try-restart", "vonk-forge-package-helper.service"], cwd=self.workspace)
+        print("EVALUATION: official package plus reviewed canonical-installations unit allowance; instrumented", flush=True)
+
     # The helper is socket-activated: it may still have PID 0 before the
     # canary's image import. Follow activation while the ordinary flow runs.
     with tempfile.TemporaryDirectory(prefix="vonk-native-stderr-") as directory:
@@ -55,6 +70,9 @@ def traced_canary(self, node_id):
             finally:
                 stopped.set()
                 thread.join(timeout=15)
+                if apply_unit_fix:
+                    self._run_command(["sudo", "-n", "rm", "--", str(unit_override)], cwd=self.workspace)
+                    self._run_command(["sudo", "-n", "systemctl", "daemon-reload"], cwd=self.workspace)
                 for process in processes:
                     # This group contains only our sudo/strace process.
                     subprocess.run(["sudo", "-n", "kill", "-INT", "--", str(-process.pid)],

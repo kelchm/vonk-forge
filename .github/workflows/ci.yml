@@ -1516,7 +1516,7 @@ jobs:
           r2_apt_state_bucket: ${{ vars.R2_APT_STATE_BUCKET }}
 
   evaluation-spark-546:
-    name: Qualify official .546 Spark lifecycle in disposable ARM64 runner
+    name: Diagnose .546 with scoped helper unit fix on ARM64
     if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
@@ -1524,6 +1524,7 @@ jobs:
       contents: read
       actions: read
     env:
+      VONK_EVALUATION_CANONICAL_INSTALLATION_ACCESS: "1"
       VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
       VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
       INSTALLER_PUBLIC_ORIGIN: https://install.vonkforge.ai
