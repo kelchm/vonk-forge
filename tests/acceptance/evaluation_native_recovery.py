@@ -456,6 +456,30 @@ def stop_native_units(units: Sequence[str]) -> None:
         require(["/usr/bin/systemctl", "--system", "stop", "--", unit], sudo=True)
 
 
+def prepare_stopped_runtime() -> None:
+    # systemd removes RuntimeDirectory when the agent stops. Offline rootless
+    # Podman inspection still requires that private runtime directory.
+    require(
+        [
+            "/usr/bin/install",
+            "-d",
+            "-o",
+            "vonk-agent",
+            "-g",
+            "vonk-agent",
+            "-m",
+            "0700",
+            "/run/vonk-forge-agent",
+        ],
+        sudo=True,
+    )
+    enabled = Path("/sys/module/apparmor/parameters/enabled")
+    if enabled.exists() and enabled.read_text().strip() == "Y":
+        profile = Path("/etc/apparmor.d/podman")
+        staging_file(profile, "distribution Podman profile", maximum=1024 * 1024)
+        require(["/usr/sbin/apparmor_parser", "--replace", str(profile)], sudo=True)
+
+
 def require_quiescent(version: str, sqlite_paths: Sequence[str]) -> None:
     status = (
         require(
@@ -567,6 +591,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
             sudo=True,
         )
     stop_native_units(helper.NATIVE_UNITS)
+    prepare_stopped_runtime()
     require_quiescent(baseline.version, helper.SQLITE_PATHS)
     checkpoint_dir = Path(arguments.checkpoint_dir)
     require(
@@ -598,6 +623,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
         raise LifecycleError("checkpoint identity does not match the baseline package")
     apt_install(artifacts.package)
     stop_native_units(helper.NATIVE_UNITS)
+    prepare_stopped_runtime()
     require_quiescent(candidate_version, helper.SQLITE_PATHS)
     live_agent = live_sha256("/usr/lib/vonk-forge/vonk-agent")
     live_helper = live_sha256("/usr/lib/vonk-forge/vonk-agent-helper")
