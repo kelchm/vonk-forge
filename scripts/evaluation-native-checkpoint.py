@@ -400,8 +400,20 @@ def symlink_destination(link_absolute: str, target: str) -> str:
 
 def allowed_symlink(link_absolute: str, target: str) -> bool:
     resolved = symlink_destination(link_absolute, target)
+    # Model adapters keep container-absolute links in retained run outputs.
+    # Preserve these as inert links; never read or restore their target bytes.
+    container_model_link = (
+        re.fullmatch(
+            r"/var/lib/vonk-forge-agent/runs/[0-9a-f-]{36}/outputs/.+",
+            link_absolute,
+        ) is not None
+        and target.startswith("/models/")
+        and resolved == target
+        and ".." not in PurePosixPath(target).parts
+    )
     return (
-        package_owned_path(resolved)
+        container_model_link
+        or package_owned_path(resolved)
         or any(is_under(resolved, root) for root in CAPTURE_NAMESPACES)
         or is_under(resolved, AGENT_STATE_ROOT)
         or is_under(resolved, DPKG_ROOT)
@@ -1387,7 +1399,11 @@ def install_from_staging(
         return
     source = staging_member_path(staging, absolute)
     destination = host_path(runtime, absolute)
-    require_inside(source, staging)
+    # A captured symlink may name the container's /models mount. Check its
+    # parent containment without dereferencing the leaf that we copy as a link.
+    require_inside(source.parent, staging)
+    if not source.is_symlink():
+        require_inside(source, staging)
     require_inside(destination.parent, runtime.fs_root)
     parent = destination.parent
     if parent.is_symlink() or not parent.is_dir():

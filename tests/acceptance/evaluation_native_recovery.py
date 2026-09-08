@@ -666,6 +666,11 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     stop_native_units(helper.NATIVE_UNITS)
     prepare_stopped_runtime()
     require_quiescent(baseline.version, helper.SQLITE_PATHS)
+    retained_link = Path(
+        "/var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model/weights"
+    )
+    require(["/usr/bin/install", "-d", "-m", "0700", str(retained_link.parent)], sudo=True)
+    require(["/usr/bin/ln", "-s", "/models/weights", str(retained_link)], sudo=True)
     checkpoint_dir = Path(arguments.checkpoint_dir)
     require(
         [
@@ -745,6 +750,9 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     restored_helper = live_sha256("/usr/lib/vonk-forge/vonk-agent-helper")
     restored_key = live_sha256("/usr/share/keyrings/vonk-forge-release.pub")
     restored_toml = live_sha256("/etc/vonk-forge-agent/agent.toml")
+    restored_link = require(["/usr/bin/readlink", str(retained_link)], sudo=True)
+    if restored_link.strip() != b"/models/weights":
+        raise LifecycleError("retained container model link was not restored")
     if (
         restored_agent != captured.get("agent_sha256")
         or restored_helper != captured.get("helper_sha256")

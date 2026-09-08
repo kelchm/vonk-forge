@@ -416,6 +416,9 @@ def test_checkpoint_and_apply_restore_fixture_bytes(
 ) -> None:
     """Fixture-root byte restore only; not physical native recovery evidence."""
     runtime, world, checkpoint_dir = harness
+    output = world.root / "var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model"
+    output.mkdir(parents=True)
+    os.symlink("/models/weights.bin", output / "weights.bin")
     report = checkpoint_ok(module, runtime, checkpoint_dir)
     metadata = json.loads((checkpoint_dir / "metadata.json").read_text())
     member_paths = {item["path"] for item in metadata["members"]}
@@ -467,6 +470,7 @@ def test_checkpoint_and_apply_restore_fixture_bytes(
     ).read_bytes() == OLD_RUNTIME
     assert (root / "usr/lib/vonk-forge/agent-link").is_symlink()
     assert os.readlink(root / "usr/lib/vonk-forge/agent-link") == "vonk-agent"
+    assert os.readlink(output / "weights.bin") == "/models/weights.bin"
     assert not (root / "usr/lib/vonk-forge/new-tool").exists()
     assert not (root / "usr/lib/vonk-forge/not-in-dpkg").exists()
     assert not (root / "etc/vonk-forge-agent/extra-candidate.conf").exists()
@@ -932,3 +936,10 @@ def test_package_file_list_accepts_dpkg_usr_merge_annotation(module, harness):
     world.package_files.append("unrecognized dpkg output")
     with pytest.raises(module.CheckpointError, match="package file list is unsafe"):
         module.dpkg_file_list(runtime)
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "/models/../etc/passwd", "/models//weights"])
+def test_container_model_link_exception_rejects_escape(module, target):
+    link = "/var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model/link"
+    assert not module.allowed_symlink(link, target)
+    assert not module.allowed_symlink("/etc/vonk-forge-agent/link", "/models/weights")
