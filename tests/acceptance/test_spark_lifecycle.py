@@ -2332,7 +2332,20 @@ class SparkLifecycle:
             or operation.get("plan_digest") != plan_digest
             or operation.get("nodes") != [node_id]
         ):
-            raise LifecycleError("synthetic canary uninstall evidence is incomplete")
+            result = operation.get("result")
+            summary = {key: operation.get(key) for key in ("id", "state", "owner_id", "plan_digest", "nodes")}
+            if isinstance(result, dict):
+                summary["successful_nodes"] = result.get("successful_nodes")
+                summary["failed_nodes"] = result.get("failed_nodes")
+                evidence = result.get("node_evidence")
+                summary["node_evidence"] = {
+                    key: {field: value.get(field) for field in (
+                        "code", "error_code", "reason", "status", "stage",
+                        "helper_error_code", "helper_exit_code", "uninstalled", "removed_model_bytes"
+                    ) if value.get(field) is not None}
+                    for key, value in evidence.items() if isinstance(value, dict)
+                } if isinstance(evidence, dict) else None
+            raise LifecycleError("synthetic canary uninstall evidence is incomplete: " + self._redact_diagnostics(json.dumps(summary), limit=3000))
         return operation
 
     @staticmethod
