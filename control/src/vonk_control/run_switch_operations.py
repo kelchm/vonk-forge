@@ -995,27 +995,28 @@ class RecipeLifecyclePhaseExecutor:
             raise RunSwitchOperationConflict(
                 f"run-switch.container-build-start-unavailable: {error}"
             ) from error
-        result = {
-            "build_id": build_id,
-            "build_input_sha256": build_input_sha256,
-            "state": getattr(value, "state", "unknown"),
-        }
-        if getattr(value, "state", None) == "succeeded":
-            with self._sessions() as session:
-                completed = session.get(RecipeBuild, build_id)
-                if completed is None:
-                    raise RunSwitchOperationConflict(
-                        "run-switch.container-build-receipt-unavailable"
-                    )
+        # The lifecycle returns an operation (queued/running), while this phase
+        # persists the build resource's canonical planned/building state.
+        with self._sessions() as session:
+            started = session.get(RecipeBuild, build_id)
+            if started is None or started.build_input_sha256 != build_input_sha256:
+                raise RunSwitchOperationConflict(
+                    "run-switch.container-build-receipt-unavailable"
+                )
+            result = {
+                "build_id": build_id,
+                "build_input_sha256": build_input_sha256,
+                "state": started.state,
+            }
+            if started.state == "succeeded":
                 result.update(
                     {
-                        "image_digest": completed.image_digest,
-                        "oci_layout_sha256": completed.oci_layout_sha256,
-                        "image_bytes": completed.image_bytes,
-                        "state": completed.state,
+                        "image_digest": started.image_digest,
+                        "oci_layout_sha256": started.oci_layout_sha256,
+                        "image_bytes": started.image_bytes,
                     }
                 )
-            return PhaseExecution(result=result)
+                return PhaseExecution(result=result)
         return PhaseExecution(value.id, result)
 
     def execute(
