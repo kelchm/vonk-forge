@@ -50,6 +50,7 @@ NATIVE_UNITS = (
     "vonk-forge-package-upgrade-recover.service",
     "vonk-forge-package-upgrade-recover-capsule.service",
     "vonk-forge-package-helper-upgrade-finish.service",
+    "vonk-forge-package-rollback.service",
 )
 SHARED_PARENTS = {
     "/",
@@ -73,6 +74,7 @@ PACKAGE_OWNED_FILE_ROOTS = {
     "/lib/systemd/system/vonk-forge-package-helper.service",
     "/lib/systemd/system/vonk-forge-package-helper.socket",
     "/lib/systemd/system/vonk-forge-package-upgrade-recover.service",
+    "/lib/systemd/system/vonk-forge-package-rollback.service",
     "/usr/share/keyrings/vonk-forge-release.pub",
 }
 PACKAGE_OWNED_DIR_ROOTS = {
