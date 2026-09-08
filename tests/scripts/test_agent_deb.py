@@ -2475,6 +2475,17 @@ def test_builder_produces_reproducible_verified_arm64_deb(tmp_path: Path) -> Non
         "ReadWritePaths=/usr/share/keyrings /usr/share/doc/vonk-forge-agent"
         in helper_unit.splitlines()
     )
+    writable_paths = {
+        path.removeprefix("-")
+        for line in helper_unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.partition("=")[2].split()
+    }
+    # Canonical model projections are installed here, and setfacl runs inside
+    # the privileged helper's mount namespace before Docker starts a recipe.
+    assert "/var/lib/vonk-forge-agent/installations" in writable_paths
+    assert "/var/lib/vonk-forge-agent" not in writable_paths
+    assert "/var/lib/vonk-forge-agent/image-imports" not in writable_paths
     assert "ReadWritePaths=/usr/share" not in helper_unit.splitlines()
     assert "ReadWritePaths=/usr" not in helper_unit.splitlines()
     assert "usermod --add-subuids" in postinst
