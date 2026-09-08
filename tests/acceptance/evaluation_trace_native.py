@@ -85,7 +85,13 @@ def traced_canary(self, node_id):
                         process.wait(timeout=5)
         if error is not None:
             trace = self._redact_diagnostics(trace_path.read_text(errors="replace"))
-            raise lifecycle.LifecycleError(f"{error}\nnative stderr trace (instrumented):\n{trace}") from error
+            snapshot = subprocess.run(
+                ["sudo", "-n", "env", "GITHUB_REPOSITORY=kelchm/vonk-forge", "/usr/bin/python3",
+                 str(self.workspace / "tests/acceptance/evaluation_native_plan_snapshot.py")],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            plans = self._redact_diagnostics(snapshot.stdout or snapshot.stderr)
+            raise lifecycle.LifecycleError(f"{error}\nnative stderr trace (instrumented):\n{trace}\nretained plan comparison:\n{plans}") from error
         return result
 
 
