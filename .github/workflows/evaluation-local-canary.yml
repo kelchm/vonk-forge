@@ -35,14 +35,15 @@ jobs:
         id: evaluation-recipe-library-source
         run: |
           set -euo pipefail
-          revision=$(cat tests/acceptance/recipe-library-revision.txt)
+          revision=$(cat tests/acceptance/evaluation-recipe-library-revision.txt)
           [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
-          test "$(awk 'END { print NR }' tests/acceptance/recipe-library-revision.txt)" = 1
+          test "$(awk 'END { print NR }' tests/acceptance/evaluation-recipe-library-revision.txt)" = 1
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "VONK_EVALUATION_RECIPE_LIBRARY_SOURCE=$revision" >> "$GITHUB_ENV"
       - name: Check out exact published canary library
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: CarstVaartjes/vonk-forge-recipes
+          repository: kelchm/vonk-forge-recipes
           ref: ${{ steps.evaluation-recipe-library-source.outputs.revision }}
           path: .recipe-library
           persist-credentials: false
@@ -108,7 +109,7 @@ jobs:
       - name: Exercise signed native installation and Vonk model lifecycle
         run: |
           set -euo pipefail
-          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = "$(cat tests/acceptance/recipe-library-revision.txt)"
+          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = "$(cat tests/acceptance/evaluation-recipe-library-revision.txt)"
           bundle="$RUNNER_TEMP/evaluation-input/bundle"
           generation=$(jq -er .generation "$bundle/assembly.json")
           source=$(jq -er .source "$bundle/assembly.json")

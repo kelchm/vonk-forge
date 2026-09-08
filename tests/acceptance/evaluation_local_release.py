@@ -849,6 +849,10 @@ class EvaluationLocalLifecycle(SparkLifecycle):
             "evaluation": {
                 "boundary": "disposable-fork",
                 "harness_source": os.environ.get("GITHUB_SHA", ""),
+                "recipe_fixture_repository": "kelchm/vonk-forge-recipes",
+                "recipe_fixture_source": os.environ.get(
+                    "VONK_EVALUATION_RECIPE_LIBRARY_SOURCE", ""
+                ),
                 "origin": self.origin,
                 "publication_acceptance": False,
                 "observation_diagnostic": os.environ.get(
