@@ -1179,7 +1179,11 @@ def test_uncached_build_receipt_reaches_copy_after_restart_without_replay(
     def start_build(build_plan, **_kwargs):
         build_start_calls.append("start")
         build_start_plans.append(build_plan)
-        return SimpleNamespace(id=child_id, state="building", owner_id=build_id)
+        with sessions.begin() as session:
+            current_build = session.get(RecipeBuild, build_id)
+            current_build.state = "building"
+        # Lifecycle returns operation state, not the build resource's state.
+        return SimpleNamespace(id=child_id, state="running", owner_id=build_id)
 
     lifecycle.preview_build = preview_build
     lifecycle.build = start_build
@@ -1438,6 +1442,9 @@ def test_container_phase_delegates_to_existing_recipe_build_child(
         row.plan["build_input_sha256"] = build_plan.build_input_sha256
 
     def start_build(*_args, **_kwargs):
+        with sessions.begin() as session:
+            current_build = session.get(RecipeBuild, build_id)
+            current_build.state = "building"
         return SimpleNamespace(id=child_id, state="running", owner_id=build_id)
 
     lifecycle_stub.build = start_build
@@ -1469,7 +1476,7 @@ def test_container_phase_delegates_to_existing_recipe_build_child(
     assert execution.result == {
         "build_id": build_id,
         "build_input_sha256": "e" * 64,
-        "state": "running",
+        "state": "building",
     }
 
     # A durable plan mutation is rejected before dispatch; execution never
