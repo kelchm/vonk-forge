@@ -1,0 +1,130 @@
+name: Local evaluation native canary
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_tag:
+        description: Fork prerelease tag evaluation/SOURCE
+        required: true
+        type: string
+      bundle_sha256:
+        description: Exact evaluation-bundle.tar SHA256
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  canary:
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      VONK_EVALUATION_DISPOSABLE: "1"
+      VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
+      VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
+      VONK_ACCEPTANCE_SPARK_CONTROLLER_BOUNDARY: loopback
+      VONK_ACCEPTANCE_WORKSPACE: ${{ github.workspace }}
+      VONK_ACCEPTANCE_LITELLM_UPSTREAM_KEY: unused-synthetic-canary-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve exact canonical recipe library source
+        id: evaluation-recipe-library-source
+        run: |
+          set -euo pipefail
+          revision=$(cat tests/acceptance/recipe-library-revision.txt)
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          test "$(awk 'END { print NR }' tests/acceptance/recipe-library-revision.txt)" = 1
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Check out exact published canary library
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: CarstVaartjes/vonk-forge-recipes
+          ref: ${{ steps.evaluation-recipe-library-source.outputs.revision }}
+          path: .recipe-library
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.1"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Retrieve exact signed local bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_TAG: ${{ inputs.bundle_tag }}
+          BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$BUNDLE_TAG" = "evaluation/$GITHUB_SHA"
+          [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          gh release download "$BUNDLE_TAG" --repo kelchm/vonk-forge \
+            --pattern evaluation-bundle.tar --dir "$RUNNER_TEMP/evaluation-input"
+          python3 - <<'PYVERIFY'
+          import hashlib, os, tarfile
+          from pathlib import Path, PurePosixPath
+          root = Path(os.environ['RUNNER_TEMP']) / 'evaluation-input'
+          archive = root / 'evaluation-bundle.tar'
+          assert archive.stat().st_size <= 1024**3
+          with archive.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == os.environ['BUNDLE_SHA256']
+          with tarfile.open(archive) as tar:
+              members = tar.getmembers()
+              assert len(members) <= 128 and sum(m.size for m in members) <= 1024**3
+              names = set()
+              for member in members:
+                  name = member.name.removeprefix('./').rstrip('/')
+                  path = PurePosixPath(name)
+                  assert name and not path.is_absolute() and '..' not in path.parts
+                  assert str(path) == name and name not in names
+                  assert member.isfile() or member.isdir()
+                  names.add(name)
+              tar.extractall(root / 'bundle', filter='data')
+          PYVERIFY
+          cmp install/installer-release-public.pem "$RUNNER_TEMP/evaluation-input/bundle/installer-release-public.pem"
+      - name: Enable CDI on the disposable runner
+        run: |
+          set -euo pipefail
+          daemon_config=/etc/docker/daemon.json
+          updated_config=$(mktemp)
+          trap 'rm -f -- "$updated_config"' EXIT
+          if sudo test -e "$daemon_config"; then
+            # Root reads the existing config; the output is an unprivileged temporary file.
+            # shellcheck disable=SC2024
+            sudo jq 'if (.features // {}) | type != "object" then error("invalid Docker features") else .features = ((.features // {}) + {"cdi": true}) end' "$daemon_config" > "$updated_config"
+          else
+            jq -n '{"features":{"cdi":true}}' > "$updated_config"
+          fi
+          sudo dockerd --validate --config-file "$updated_config"
+          sudo install -D -o root -g root -m 0644 "$updated_config" "$daemon_config"
+          sudo systemctl restart docker.service
+          docker info --format '{{json .CDISpecDirs}}' | jq -e 'index("/etc/cdi") != null and index("/var/run/cdi") != null' >/dev/null
+      - name: Exercise signed native installation and Vonk model lifecycle
+        run: |
+          set -euo pipefail
+          test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = "$(cat tests/acceptance/recipe-library-revision.txt)"
+          bundle="$RUNNER_TEMP/evaluation-input/bundle"
+          generation=$(jq -er .generation "$bundle/assembly.json")
+          source=$(jq -er .source "$bundle/assembly.json")
+          version=$(jq -er .version "$bundle/assembly.json")
+          test "$source" = "$GITHUB_SHA"
+          [[ "$generation" =~ ^[0-9a-f]{64}$ ]]
+          release="$bundle/objects/artifacts/dev/releases/$generation/release.json"
+          export VONK_ACCEPTANCE_COMPOSE_OVERLAY="$bundle/compose-overlay.yml"
+          mkdir -p "$RUNNER_TEMP/evaluation-proof"
+          uv run --with-editable "$VONK_RECIPE_LIBRARY_ROOT/contracts" \
+            python tests/acceptance/evaluation_local_release.py run \
+              --candidate-release "$release" --object-root "$bundle/objects" \
+              --installer-public-key install/installer-release-public.pem \
+              --compose-overlay "$bundle/compose-overlay.yml" \
+              --channel dev --version "$version" --source-sha "$source" \
+              --generation "$generation" --run-id "$GITHUB_RUN_ID" --platform linux-arm64 \
+              --output "$RUNNER_TEMP/evaluation-proof/report.json"
+      - name: Retain bounded lifecycle proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evaluation-native-proof-${{ github.sha }}
+          path: ${{ runner.temp }}/evaluation-proof/report.json
+          retention-days: 7
+          if-no-files-found: ignore
