@@ -1542,6 +1542,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Resolve exact canonical recipe library source
         id: evaluation-recipe-library-source
         run: |
@@ -1593,6 +1594,32 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y strace
+      - name: Install pinned Rust for read-only source probes
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.97.1
+          rustup default 1.97.1
+      - name: Restore ARM64 Rust dependency cache for read-only probes
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: linux-arm64
+          add-job-id-key: "false"
+          save-if: "false"
+      - name: Build fixed and baseline read-only reconstruction probes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p vonk-agent --test runtime_observation
+          cargo build --locked --release -p vonk-agent --example evaluation_retained_plan_probe
+          sudo install -D -m 0755 target/release/examples/evaluation_retained_plan_probe \
+            /usr/local/libexec/vonk-evaluation-retained-fixed
+          oci_source=rust/crates/vonk-agent/src/oci.rs
+          saved_source=$(mktemp)
+          cp "$oci_source" "$saved_source"
+          trap 'cp "$saved_source" "$oci_source"; rm -f "$saved_source"' EXIT
+          git show fb2626a00e545138dda6393005490ae73e763014:rust/crates/vonk-agent/src/oci.rs > "$oci_source"
+          cargo build --locked --release -p vonk-agent --example evaluation_retained_plan_probe
+          sudo install -m 0755 target/release/examples/evaluation_retained_plan_probe \
+            /usr/local/libexec/vonk-evaluation-retained-baseline
       - name: Run official package and image lifecycle
         run: |
           set -euo pipefail

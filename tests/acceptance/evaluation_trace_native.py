@@ -91,6 +91,18 @@ def traced_canary(self, node_id):
                 capture_output=True, text=True, timeout=15, check=False,
             )
             plans = self._redact_diagnostics(snapshot.stdout or snapshot.stderr)
+            comparisons = []
+            for version in ("baseline", "fixed"):
+                probe = Path("/usr/local/libexec") / f"vonk-evaluation-retained-{version}"
+                if probe.exists():
+                    result = subprocess.run(
+                        ["sudo", "-n", "-u", "vonk-agent", "env",
+                         "GITHUB_REPOSITORY=kelchm/vonk-forge", str(probe)],
+                        capture_output=True, text=True, timeout=15, check=False,
+                    )
+                    comparisons.append({"source": version, "exit_code": result.returncode,
+                                        "output": result.stdout + result.stderr})
+            plans += "\nread-only source probes: " + self._redact_diagnostics(str(comparisons))
             raise lifecycle.LifecycleError(f"{error}\nnative stderr trace (instrumented):\n{trace}\nretained plan comparison:\n{plans}") from error
         return result
 
