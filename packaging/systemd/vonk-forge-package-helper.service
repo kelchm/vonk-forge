@@ -41,6 +41,8 @@ ReadWritePaths=/var/lib/vonk-forge /var/lib/dpkg /var/log /var/cache/apt /var/ca
 ReadWritePaths=/usr/share/keyrings /usr/share/doc/vonk-forge-agent
 BindReadOnlyPaths=-/run/docker.sock -/run/vonk-forge-agent/runtime-requests -/var/lib/vonk-forge-agent/image-imports
 ReadWritePaths=-/var/lib/vonk-forge-agent/models -/var/lib/vonk-forge-agent/runs -/var/lib/vonk-forge-agent/run-metadata
+# Canonical installation projections need runtime-UID ACLs before launch.
+ReadWritePaths=-/var/lib/vonk-forge-agent/installations
 TimeoutStartSec=30s
 TimeoutStopSec=15s
 KillMode=mixed
