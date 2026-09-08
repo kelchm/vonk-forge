@@ -255,7 +255,9 @@ def test_harness_source_stays_on_the_package_filesystem_boundary() -> None:
     assert "package-filesystem" in text
     assert "native_bootstrap_acceptance" in text
     assert "EvaluationLocalLifecycle" not in text
-    assert "SparkLifecycle" not in text
+    # Only its existing diagnostic redactor is reused; no lifecycle is created.
+    assert "SparkLifecycle(" not in text
+    assert "SparkLifecycle._redact_diagnostics(" in text
     assert "--force-downgrade" in text
     assert "force-downgrade is refused" in text
     assert "ssh" not in text.lower() or "no ssh" in text.lower()
@@ -306,7 +308,7 @@ def test_recover_mocked_success_is_not_native_bootstrap_evidence(
         "trusted_identity": "8" * 64,
     }
     fixture_toml = hashlib.sha256(
-        b'node_id = "evaluation-native-recovery-fixture"\n'
+        b'node_id = "spk_00000000000000000000000000000001"\n'
     ).hexdigest()
     candidate_hashes = {
         "/usr/lib/vonk-forge/vonk-agent": "9" * 64,

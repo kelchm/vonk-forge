@@ -40,6 +40,7 @@ from tests.acceptance.evaluation_local_release import (
 )
 from tests.acceptance.test_spark_lifecycle import (
     LifecycleError,
+    SparkLifecycle,
     _atomic_write,
 )
 
@@ -57,7 +58,11 @@ STOPPED, SKIP_LOAD = (
     frozenset({"not-found", "masked"}),
 )
 MAX_ARCHIVE_BYTES, MAX_MEMBERS = 1024**3, 128
-FIXTURE_TOML = b'node_id = "evaluation-native-recovery-fixture"\n'
+FIXTURE_TOML = b'node_id = "spk_00000000000000000000000000000001"\n'
+# Public RFC 8032 test-vector key; no private grant key or enrollment is used.
+FIXTURE_AUTHORITY = (
+    b"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n"
+)
 FIXTURE_CREDENTIAL = b"evaluation-native-recovery-fixture-credential\n"
 DENIED = (
     "controller_started",
@@ -470,8 +475,26 @@ def wait_for_package_finisher(paths: Sequence[str]) -> None:
         if not pending:
             return
         if time.monotonic() >= deadline:
+            journal = run(
+                [
+                    "/usr/bin/journalctl",
+                    "--no-pager",
+                    "-n",
+                    "40",
+                    "-u",
+                    "vonk-forge-package-helper.service",
+                ],
+                sudo=True,
+            )
+            diagnostic = SparkLifecycle._redact_diagnostics(
+                journal.stdout.decode(errors="replace"),
+                limit=4000,
+            )
             raise LifecycleError(
-                "package activation did not finish: " + ", ".join(pending)
+                "package activation did not finish: "
+                + ", ".join(pending)
+                + "; helper journal: "
+                + diagnostic
             )
         time.sleep(1)
 
@@ -593,6 +616,8 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     )
     toml_path.write_bytes(FIXTURE_TOML)
     cred_path.write_bytes(FIXTURE_CREDENTIAL)
+    authority_path = fixtures / "host-helper-authority.pub"
+    authority_path.write_bytes(FIXTURE_AUTHORITY)
     connection = sqlite3.connect(sqlite_path)
     try:
         connection.execute("CREATE TABLE fixture (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
@@ -604,6 +629,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
         connection.close()
     for source, destination, mode in (
         (toml_path, "/etc/vonk-forge-agent/agent.toml", "0640"),
+        (authority_path, "/etc/vonk-forge-agent/host-helper-authority.pub", "0644"),
         (cred_path, "/var/lib/vonk-forge-agent/credentials/fixture.key", "0600"),
         (sqlite_path, "/var/lib/vonk-forge-agent/state.sqlite", "0600"),
     ):
