@@ -470,6 +470,7 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
 ) -> None:
     run = EvaluationLocalLifecycle.__new__(EvaluationLocalLifecycle)
     run.temporary_root = tmp_path
+    run.arguments = SimpleNamespace(version="0.1.1~dev.546+g88480698a951")
     run.firewall_environment = {"VONK_NAS_MANAGEMENT_IP": "172.31.20.2"}
     run.artifacts = SimpleNamespace(
         spark_setup=tmp_path / "vonk-spark-setup",
@@ -504,6 +505,10 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
         os.fspath(run.artifacts.spark_setup),
         "--package",
     ]
+    staged = Path(observed["command"][2])
+    assert staged.name == "vonk-forge-agent_0.1.1~dev.546+g88480698a951_arm64.deb"
+    assert staged.read_bytes() == run.artifacts.package.read_bytes()
+    assert staged.stat().st_mode & 0o777 == 0o600
     assert observed["command"][-1] == "--enroll"
     assert "https://install.vonkforge.ai" not in repr(observed["command"])
     assert "VONK_INSTALL_BASE_URL" not in observed["environment"]
