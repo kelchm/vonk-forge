@@ -21,7 +21,9 @@ use crate::{
     health::readiness_endpoint,
     inventory::{available_disk_bytes, available_memory_bytes},
     process::{ProcessError, ProcessRunner, Program},
-    workloads::{CompiledExecutionPlan, Placement, WorkloadError, managed_path},
+    workloads::{
+        CompiledExecutionPlan, Placement, WorkloadError, managed_path, same_installed_workload,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -1009,13 +1011,48 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
             return Err(OciError::Artifact);
         }
         managed_path(self.data_root, "installations", &record.installation_id)?;
-        let spec = self.load_spec(&record.installation_id)?;
+        let mut installed = self.load_spec(&record.installation_id)?;
+        let spec = self.load_run_runtime_plan(&metadata)?;
+        // prepare_job_start permits a shorter per-run timeout. Preserve that
+        // bound without relaxing the installed identity check for start requests.
+        if let (Some(installed_job), Some(run_job)) = (&mut installed.job, &spec.job) {
+            if run_job.timeout_seconds > installed_job.timeout_seconds {
+                return Err(OciError::Artifact);
+            }
+            installed_job.timeout_seconds = run_job.timeout_seconds;
+        }
+        if !same_installed_workload(&installed, &spec) {
+            return Err(OciError::Artifact);
+        }
         Ok(Some((
             spec,
             record.installation_id,
             record.placement,
             record.observation,
         )))
+    }
+
+    fn load_run_runtime_plan(&self, metadata: &Path) -> Result<CompiledExecutionPlan, OciError> {
+        let path = metadata.join("runtime.json");
+        let file_metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(OciError::Artifact);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !file_metadata.file_type().is_file()
+            || file_metadata.file_type().is_symlink()
+            || file_metadata.len() > MAX_COMPILED_EXECUTION_PLAN_SPEC_BYTES as u64
+        {
+            return Err(OciError::Artifact);
+        }
+        let spec: CompiledExecutionPlan = serde_json::from_slice(&read_regular_file(
+            &path,
+            MAX_COMPILED_EXECUTION_PLAN_SPEC_BYTES as u64,
+        )?)?;
+        spec.validate()?;
+        Ok(spec)
     }
 
     fn read_run_lifecycle(&self, path: &Path) -> Result<Option<RunLifecycle>, OciError> {
@@ -2160,6 +2197,60 @@ mod tests {
 
     fn authorize_installation(installation: &Path, recipe_digest: &str) {
         fs::write(installation.join("recipe-content.sha256"), recipe_digest).unwrap();
+    }
+
+    #[test]
+    fn retained_job_plan_keeps_shorter_timeout_but_rejects_wider_or_changed_job() {
+        let data = tempdir().unwrap();
+        let mut value = compiled_plan();
+        value["endpoint"] = Value::Null;
+        value["runtime"]["placement"]["port"] = Value::Null;
+        value["job"] = json!({"interface": "image-job", "input": null,
+                              "output_path": "/outputs", "timeout_seconds": 300});
+        let installed: crate::workloads::CompiledExecutionPlan =
+            serde_json::from_value(value).unwrap();
+        installed.validate().unwrap();
+        let (installation_id, _, installed) =
+            persisted_plan_installation(data.path(), Uuid::new_v4().to_string(), installed);
+        let runtime = runtime(data.path(), &NoProcess);
+        let run_id = Uuid::new_v4().to_string();
+        let metadata = runtime.ensure_run_metadata(&run_id).unwrap();
+        fs::write(
+            metadata.join("lifecycle.json"),
+            serde_json::to_vec(&json!({
+                "installation_id": installation_id,
+                "placement": {"endpoint_address": null, "rank": 0, "role": "entrypoint",
+                    "world_size": 1, "local_address": null, "master_address": null,
+                    "master_port": null, "port": 1024, "reserved_memory_bytes": 4096},
+                "observation": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut run = installed.clone();
+        run.job.as_mut().unwrap().timeout_seconds = 120;
+        fs::write(
+            metadata.join("runtime.json"),
+            serde_json::to_vec(&run).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(runtime.load_run_lifecycle(&run_id).unwrap().unwrap().0, run);
+        assert_eq!(runtime.load_spec(&installation_id).unwrap(), installed);
+        for (timeout, interface) in [(301, "image-job"), (120, "audio-job")] {
+            let job = run.job.as_mut().unwrap();
+            job.timeout_seconds = timeout;
+            job.interface = interface.to_owned();
+            run.validate().unwrap();
+            fs::write(
+                metadata.join("runtime.json"),
+                serde_json::to_vec(&run).unwrap(),
+            )
+            .unwrap();
+            assert!(matches!(
+                runtime.load_run_lifecycle(&run_id),
+                Err(OciError::Artifact)
+            ));
+        }
     }
 
     #[test]
