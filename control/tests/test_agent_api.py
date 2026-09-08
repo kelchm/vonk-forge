@@ -3468,6 +3468,7 @@ def test_staged_certificate_can_only_activate_and_activation_is_idempotent_after
 def test_failed_result_preserves_canonical_evidence_and_maps_parent_reason(
     agent_system,
     with_diagnostics,
+    monkeypatch,
 ) -> None:
     client, services, _, clock = agent_system
     services.operations.enqueue(
@@ -3529,8 +3530,16 @@ def test_failed_result_preserves_canonical_evidence_and_maps_parent_reason(
             assert "should-never-persist" not in typed.model_dump_json()
         assert parent_job is not None and parent_job.status_reason == "stop_failed"
     if with_diagnostics:
+        from types import SimpleNamespace
+
+        from vonk_control import failure_evidence
         from vonk_control.failure_evidence import FailureEvidenceService
 
+        # This verifies evidence contents, not the collector's scheduling budget.
+        # A busy runner can consume its 250 ms allowance before the first page.
+        monkeypatch.setattr(
+            failure_evidence, "time", SimpleNamespace(monotonic=lambda: 0.0)
+        )
         evidence = FailureEvidenceService(services.sessions, clock=clock)
         assert evidence.tick()
         content, _, bundle = evidence.read(claim["operation_id"], claim["attempt"])

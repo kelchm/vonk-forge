@@ -2673,7 +2673,9 @@ def _run_model_run(
             }
         return client.request("POST", "/api/v1/recipes/run-switches", payload)
     if command == "cancel":
-        from .generated_control.models.run_switch_cancel_request import RunSwitchCancelRequest
+        from .generated_control.models.run_switch_cancel_request import (
+            RunSwitchCancelRequest,
+        )
 
         payload = RunSwitchCancelRequest.from_dict({
             "schema_version": 2,
