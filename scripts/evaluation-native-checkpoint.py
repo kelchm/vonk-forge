@@ -1229,7 +1229,10 @@ def extra_restore_paths(
     }
     unmanaged = unmanaged_agent_state_paths(runtime)
     if unmanaged:
-        raise CheckpointError("restore scope is uncertain")
+        raise CheckpointError(
+            "restore scope is uncertain: unmanaged agent directories "
+            + ", ".join(unmanaged[:10])
+        )
     live_package_files = dpkg_file_list(runtime)
     live = {item["path"] for item in collect_members(runtime, live_package_files)}
     extras: list[str] = []
@@ -1237,7 +1240,7 @@ def extra_restore_paths(
         if ca_or_server_path(path) or immutable_path(path) or dpkg_lock_path(path):
             continue
         if not allowed_extra_removal(path):
-            raise CheckpointError("restore scope is uncertain")
+            raise CheckpointError("restore scope is uncertain: extra path " + path)
         extras.append(path)
     extras.extend(extra_candidate_files(runtime, package_files))
     unique = sorted(
