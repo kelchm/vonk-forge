@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Assemble an operator-signed, local-file evaluation bundle; publish no pointer."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+
+ROOT = Path(__file__).resolve().parents[1]
+PLATFORMS = ("linux-arm64", "linux-amd64", "darwin-arm64", "darwin-amd64")
+ROLES = {
+    "api": ["control-api"],
+    "worker": ["control-worker"],
+    "hermes": ["hermes-agent"],
+    "litellm": ["litellm", "hermes-litellm-key-provisioner"],
+}
+
+
+def canonical(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def read(path: Path, maximum: int = 1024**3, *, private: bool = False) -> bytes:
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or not 0 < info.st_size <= maximum
+        or (private and info.st_mode & 0o077)
+    ):
+        raise ValueError(f"unsafe input: {path.name}")
+    return path.read_bytes()
+
+
+def record(raw: bytes) -> dict[str, object]:
+    return {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}
+
+
+def sign(key: rsa.RSAPrivateKey, raw: bytes) -> bytes:
+    signature = key.sign(raw, padding.PKCS1v15(), hashes.SHA256())
+    key.public_key().verify(signature, raw, padding.PKCS1v15(), hashes.SHA256())
+    return base64.b64encode(signature) + b"\n"
+
+
+def images_from(directory: Path, source: str) -> dict[str, str]:
+    images = {}
+    for role in ROLES:
+        paths = list(
+            directory.rglob(f"evaluation-image-{role}-{source}/evaluation-image.json")
+        )
+        if len(paths) != 1:
+            raise ValueError(f"one exact {role} image receipt is required")
+        item = json.loads(read(paths[0], 16384))
+        prefix = f"ghcr.io/kelchm/vonk-forge-evaluation-{role}:dev-sha-{source}@sha256:"
+        if (
+            item.get("source") != source
+            or item.get("role") != role
+            or re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", item.get("image", ""))
+            is None
+        ):
+            raise ValueError(f"{role} image receipt identity mismatch")
+        images[role] = item["image"]
+    return images
+
+
+def setup_bytes(path: Path) -> bytes:
+    """Verify the exact file against its same-artifact build checksum list."""
+    raw = read(path, 64 * 1024**2)
+    lines = read(path.parent / "SHA256SUMS", 16384).decode("ascii").splitlines()
+    checksums = {}
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  (vonk-(?:nas|spark)-setup)", line)
+        if match is None or match[2] in checksums:
+            raise ValueError("invalid setup checksum list")
+        checksums[match[2]] = match[1]
+    if checksums.get(path.name) != hashlib.sha256(raw).hexdigest():
+        raise ValueError("setup checksum mismatch")
+    return raw
+
+
+def nas_setup_from(directory: Path, source: str, platform: str) -> bytes:
+    # installer-setups uploads runner.temp/setup, retaining the platform folder.
+    artifact = directory / f"installer-setup-{source}-{platform}"
+    return setup_bytes(artifact / platform / "vonk-nas-setup")
+
+
+def bootstrap(kind: str, public: bytes) -> bytes:
+    # These entry points consume only the signed local bundle. No upstream URL
+    # or channel manifest participates in operator bootstrap authority.
+    common = (
+        """#!/bin/sh
+set -eu
+base=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT HUP INT TERM
+cat > "$scratch/key.pem" <<'VONK_LOCAL_RELEASE_PUBLIC_KEY'
+"""
+        + public.decode()
+        + """VONK_LOCAL_RELEASE_PUBLIC_KEY
+verify_signed() {
+  test -f "$1" && test ! -L "$1"
+  test -f "$2" && test ! -L "$2"
+  test "$(wc -c < "$2" | tr -d ' ')" -eq 513
+  LC_ALL=C grep -Eq '^[A-Za-z0-9+/]+$' "$2"
+  openssl base64 -d -A -in "$2" -out "$scratch/signature"
+  openssl dgst -sha256 -verify "$scratch/key.pem" -signature "$scratch/signature" "$1" >/dev/null
+}
+verify_signed "$base/release.json" "$base/release.sig"
+python3 - "$base" <<'VONK_VERIFY_LOCAL_GRAPH'
+import hashlib, json, re, stat, sys
+from pathlib import Path, PurePosixPath
+base = Path(sys.argv[1])
+manifest = base / 'release.json'
+assert 0 < manifest.stat().st_size <= 256 * 1024
+raw = manifest.read_bytes()
+doc = json.loads(raw)
+assert raw == (json.dumps(doc, sort_keys=True, separators=(',', ':')) + '\\n').encode()
+assert doc['schema_version'] == 2 and doc['channel'] == 'dev'
+assert re.fullmatch('[0-9a-f]{64}', doc['generation'])
+prefix = 'artifacts/dev/releases/' + doc['generation'] + '/'
+for entry in [*doc['artifacts'].values(), *doc['bootstraps'].values()]:
+    assert entry['path'].startswith(prefix)
+    relative = entry['path'][len(prefix):]
+    parts = PurePosixPath(relative).parts
+    assert parts and not relative.startswith('/') and '..' not in parts
+    assert str(PurePosixPath(relative)) == relative
+    target = base
+    for part in parts:
+        target = target / part
+        assert not target.is_symlink()
+    info = target.lstat()
+    assert stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 1024**3
+    assert info.st_size == entry['size']
+    with target.open('rb') as stream:
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    assert digest == entry['sha256']
+VONK_VERIFY_LOCAL_GRAPH
+"""
+    )
+    if kind == "spark":
+        common += """test "$(uname -s):$(uname -m)" = Linux:aarch64
+program="$base/spark/current/linux-arm64/vonk-spark-setup"
+"""
+    else:
+        common += """case "$(uname -s):$(uname -m)" in
+  Linux:aarch64) platform=linux-arm64 ;;
+  Linux:x86_64) platform=linux-amd64 ;;
+  Darwin:arm64) platform=darwin-arm64 ;;
+  Darwin:x86_64) platform=darwin-amd64 ;;
+  *) exit 64 ;;
+esac
+program="$base/nas/current/$platform/vonk-nas-setup"
+"""
+    common += """verify_signed "$program" "$program.sig"
+"""
+    if kind == "spark":
+        common += """"$program" --package "$base/spark/current/linux-arm64/vonk-forge-agent.deb" --release-manifest "$base/release.json" --release-signature "$base/release.sig" --setup-signature "$program.sig" "$@"
+"""
+    else:
+        common += """verify_signed "$base/nas/current/payload.json" "$base/nas/current/payload.json.sig"
+"$program" --template "$base/nas/current/payload.json" "$@"
+"""
+    return common.encode()
+
+
+def assemble(args: argparse.Namespace) -> dict[str, object]:
+    if re.fullmatch(r"[0-9a-f]{40}", args.source) is None or args.output.exists():
+        raise ValueError("invalid source or existing output")
+    key = serialization.load_pem_private_key(
+        read(args.signing_key, 16384, private=True), None
+    )
+    if not isinstance(key, rsa.RSAPrivateKey) or key.key_size != 3072:
+        raise ValueError("installer key must be RSA-3072")
+    public = key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    if public != read(ROOT / "install/installer-release-public.pem", 16384):
+        raise ValueError("installer signing key does not match compiled authority")
+    package = read(args.package)
+    provenance = json.loads(
+        read(args.package.with_suffix(".provenance.json"), 4 * 1024**2)
+    )
+    definition = provenance["predicate"]["buildDefinition"]
+    if definition["resolvedDependencies"] != [
+        {
+            "digest": {"gitCommit": args.source},
+            "uri": "https://github.com/kelchm/vonk-forge",
+        }
+    ]:
+        raise ValueError("package source provenance mismatch")
+    parameters = definition["externalParameters"]
+    version = parameters["version"]
+    if (
+        re.fullmatch(r"0\.1\.1~dev\.546\+g" + args.source[:12], version) is None
+        or args.package.name != f"vonk-forge-agent_{version}_arm64.deb"
+        or parameters["architecture"] != "linux-arm64"
+    ):
+        raise ValueError("package identity mismatch")
+    host_signature = read(Path(str(args.package) + ".host.sig"), 1024)
+    package_key = serialization.load_pem_public_key(
+        read(args.package_public_key, 16384)
+    )
+    if not isinstance(package_key, ed25519.Ed25519PublicKey):
+        raise TypeError("package authority must be Ed25519")
+    package_key.verify(
+        bytes.fromhex(host_signature.decode().strip()),
+        b"VONK-HOST-ARTIFACT-V1\0deb\0" + hashlib.sha256(package).digest(),
+    )
+    binary_digest = next(
+        item["digest"]["sha256"]
+        for item in provenance["subject"]
+        if item["name"] == "vonk-agent"
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", binary_digest) is None
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", parameters["build_digest"]) is None
+    ):
+        raise ValueError("native binary identity mismatch")
+    images = images_from(args.images, args.source)
+    args.output.mkdir(parents=True, mode=0o700)
+    compose = args.output / "docker-compose.pinned.yml"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/render-dev-compose"),
+            "--channel",
+            "pinned",
+            "--output",
+            str(compose),
+            *[part for role in ROLES for part in (f"--{role}-image", images[role])],
+        ],
+        check=True,
+        capture_output=True,
+    )
+    (args.output / "compose-overlay.yml").write_text(
+        yaml.safe_dump(
+            {
+                "services": {
+                    service: {"image": images[role]}
+                    for role, services in ROLES.items()
+                    for service in services
+                }
+            },
+            sort_keys=True,
+        )
+    )
+    payload_path = args.output / "payload.json"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/build-nas-compose-bundle"),
+            "--channel",
+            "dev",
+            "--compose",
+            str(compose),
+            "--output",
+            str(payload_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    payload = json.loads(payload_path.read_bytes())
+    projected = yaml.safe_load(payload["docker_compose_yaml"])
+    pinned = yaml.safe_load(compose.read_bytes())
+    for name, service in projected["services"].items():
+        service["image"] = pinned["services"][name]["image"]
+        service.pop("pull_policy", None)
+    payload["docker_compose_yaml"] = yaml.safe_dump(projected, sort_keys=False)
+    payload_raw = canonical(payload)
+    files: dict[str, tuple[str, bytes, int]] = {}
+    for platform in PLATFORMS:
+        raw = nas_setup_from(args.setups, args.source, platform)
+        path = f"nas/current/{platform}/vonk-nas-setup"
+        files[f"nas-setup-{platform}"] = (path, raw, 0o755)
+        files[f"nas-setup-signature-{platform}"] = (
+            path + ".sig",
+            sign(key, raw),
+            0o644,
+        )
+    raw = setup_bytes(
+        args.setups
+        / f"installer-setup-{args.source}-linux-arm64"
+        / "linux-arm64"
+        / "vonk-spark-setup"
+    )
+    files["spark-setup-linux-arm64"] = (
+        "spark/current/linux-arm64/vonk-spark-setup",
+        raw,
+        0o755,
+    )
+    files["spark-setup-signature-linux-arm64"] = (
+        "spark/current/linux-arm64/vonk-spark-setup.sig",
+        sign(key, raw),
+        0o644,
+    )
+    files["agent-package-linux-arm64"] = (
+        "spark/current/linux-arm64/vonk-forge-agent.deb",
+        package,
+        0o644,
+    )
+    files["agent-package-signature-linux-arm64"] = (
+        "spark/current/linux-arm64/vonk-forge-agent.deb.host.sig",
+        host_signature,
+        0o644,
+    )
+    files["nas-payload"] = ("nas/current/payload.json", payload_raw, 0o644)
+    files["nas-payload-signature"] = (
+        "nas/current/payload.json.sig",
+        sign(key, payload_raw),
+        0o644,
+    )
+    scripts = {kind: bootstrap(kind, public) for kind in ("nas", "spark")}
+    generation = hashlib.sha256(
+        canonical(
+            {
+                "source": args.source,
+                "version": version,
+                "images": images,
+                "files": {name: record(value[1]) for name, value in files.items()},
+                "bootstraps": {name: record(raw) for name, raw in scripts.items()},
+            }
+        )
+    ).hexdigest()
+    prefix = f"artifacts/dev/releases/{generation}"
+    root = args.output / "objects" / prefix
+    artifacts = {}
+    for name, (path, raw, mode) in files.items():
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        target.chmod(mode)
+        artifacts[name] = {"path": prefix + "/" + path, **record(raw)}
+    artifacts["agent-package-linux-arm64"].update(
+        {
+            "architecture": "linux-arm64",
+            "host_signature": host_signature.decode().strip(),
+            "package_version": version,
+            "target_binary_digest": binary_digest,
+            "target_build_digest": parameters["build_digest"],
+        }
+    )
+    bootstraps = {}
+    for name, raw in scripts.items():
+        path = root / "bootstraps" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(raw)
+        path.chmod(0o755)
+        bootstraps[name] = {"path": prefix + "/bootstraps/" + name, **record(raw)}
+    release = {
+        "schema_version": 2,
+        "channel": "dev",
+        "source_sha": args.source,
+        "version": version,
+        "generation": generation,
+        "images": images,
+        "artifacts": artifacts,
+        "bootstraps": bootstraps,
+    }
+    raw = canonical(release)
+    (root / "release.json").write_bytes(raw)
+    (root / "release.sig").write_bytes(sign(key, raw))
+    (args.output / "installer-release-public.pem").write_bytes(public)
+    receipt = {
+        "source": args.source,
+        "generation": generation,
+        "version": version,
+        "release_sha256": hashlib.sha256(raw).hexdigest(),
+        "physical_qualification": "pending",
+        "publication": "local files only; no upstream pointer or acceptance claim",
+    }
+    (args.output / "assembly.json").write_bytes(canonical(receipt))
+    return receipt
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    for name in (
+        "package",
+        "package-public-key",
+        "setups",
+        "images",
+        "signing-key",
+        "output",
+    ):
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--source", required=True)
+    print(json.dumps(assemble(parser.parse_args()), sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
