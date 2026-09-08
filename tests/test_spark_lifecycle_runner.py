@@ -1062,3 +1062,25 @@ def test_native_start_failure_inspects_only_valid_container_ids() -> None:
     assert "OCI runtime create failed" in result
     inspections = [command for command in observed if command[1:3] == ["container", "inspect"]]
     assert inspections == [["docker", "container", "inspect", "--format", '{{json .State.Status}} {{json .State.Error}} {{json .State.ExitCode}}', identifier]]
+
+
+def test_canary_final_failure_retains_exact_run_status() -> None:
+    lifecycle = _module()
+    run = lifecycle.SparkLifecycle.__new__(lifecycle.SparkLifecycle)
+    run_id = "00000000-0000-4000-8000-000000000005"
+    calls = []
+
+    def request(method, path):
+        calls.append((method, path))
+        return 200, {"id": run_id, "state": "failed", "route_state": "withdrawn", "healthy": False, "ranks": []}
+
+    run.control = SimpleNamespace(request=request)
+    details = json.loads(run._canary_run_switch_failure_evidence({
+        "current_phase": "final_verify", "result": {
+            "phase_results": [{"run_id": run_id}, {"run_id": "../../invalid"}],
+            "final_observation": {"healthy": False},
+        },
+    }))
+    assert details["run"]["state"] == "failed"
+    assert details["final_observation"] == {"healthy": False}
+    assert calls == [("GET", f"/api/v1/recipes/runs/{run_id}")]

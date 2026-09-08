@@ -1086,6 +1086,12 @@ class SparkLifecycle:
         ])
         if firewall is not None and firewall.returncode == 0:
             parts.append("Docker and firewall journal:\n" + self._redact_diagnostics(firewall.stdout)[-2_000:])
+        observations = self._diagnostic_command([
+            "sudo", "-n", "journalctl", "--no-pager", "-o", "cat", "-n", "30",
+            "-u", "vonk-forge-agent.service", "--grep=exact recipe observation failed",
+        ])
+        if observations is not None and observations.returncode == 0:
+            parts.append("exact observation failures:\n" + self._redact_diagnostics(observations.stdout)[-2_000:])
         return "\n".join(parts)
 
     def _cleanup(self) -> None:
@@ -2326,6 +2332,20 @@ class SparkLifecycle:
             except (SliceError, ServingExecutionError) as error:
                 # Diagnostics must not replace the original lifecycle failure.
                 details["child_lookup_error"] = type(error).__name__
+        details["final_observation"] = result.get("final_observation")
+        phases = result.get("phase_results")
+        if isinstance(phases, list):
+            for phase in reversed(phases):
+                run_id = phase.get("run_id") if isinstance(phase, dict) else None
+                if not isinstance(run_id, str) or UUID.fullmatch(run_id) is None:
+                    continue
+                try:
+                    _, payload = self.control.request("GET", f"/api/v1/recipes/runs/{run_id}")
+                    run = require_object(payload, "failed canary run")
+                    details["run"] = {name: run.get(name) for name in ("id", "alias", "state", "route_state", "healthy", "ranks")}
+                except (SliceError, ServingExecutionError) as error:
+                    details["run_lookup_error"] = type(error).__name__
+                break
         def redact(value):
             if isinstance(value, str):
                 return self._redact_diagnostics(value)
