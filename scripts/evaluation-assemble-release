@@ -165,7 +165,17 @@ program="$base/nas/current/$platform/vonk-nas-setup"
     common += """verify_signed "$program" "$program.sig"
 """
     if kind == "spark":
-        common += """"$program" --package "$base/spark/current/linux-arm64/vonk-forge-agent.deb" --release-manifest "$base/release.json" --release-signature "$base/release.sig" --setup-signature "$program.sig" "$@"
+        common += """version=$(python3 - "$base/release.json" <<'VONK_PACKAGE_NAME'
+import json, re, sys
+version = json.load(open(sys.argv[1]))['version']
+assert re.fullmatch(r'[0-9A-Za-z.+~:-]+', version)
+print(version)
+VONK_PACKAGE_NAME
+)
+package="$scratch/vonk-forge-agent_${version}_arm64.deb"
+cp "$base/spark/current/linux-arm64/vonk-forge-agent.deb" "$package"
+chmod 600 "$package"
+"$program" --package "$package" --release-manifest "$base/release.json" --release-signature "$base/release.sig" --setup-signature "$program.sig" "$@"
 """
     else:
         common += """verify_signed "$base/nas/current/payload.json" "$base/nas/current/payload.json.sig"

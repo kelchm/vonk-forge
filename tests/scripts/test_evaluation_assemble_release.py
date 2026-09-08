@@ -29,33 +29,36 @@ def signing_key():
     return rsa.generate_private_key(public_exponent=65537, key_size=3072)
 
 
-def local_bundle(tmp_path, signing_key):
+def local_bundle(tmp_path, signing_key, kind="nas"):
     platforms = {
         ("Darwin", "arm64"): "darwin-arm64",
         ("Darwin", "x86_64"): "darwin-amd64",
         ("Linux", "aarch64"): "linux-arm64",
         ("Linux", "x86_64"): "linux-amd64",
     }
-    selected = platforms[(platform.system(), platform.machine())]
+    selected = "linux-arm64" if kind == "spark" else platforms[(platform.system(), platform.machine())]
     public = signing_key.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
     )
     root = tmp_path / "release"
     (root / "bootstraps").mkdir(parents=True)
-    program = root / "nas/current" / selected / "vonk-nas-setup"
+    program = root / f"{kind}/current" / selected / f"vonk-{kind}-setup"
     program.parent.mkdir(parents=True)
     program.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$VONK_TEST_MARKER"\n')
+    if kind == "spark":
+        with program.open("a") as stream:
+            stream.write('cat "$2" > "$VONK_TEST_MARKER.package"\n')
     program.chmod(0o755)
     Path(str(program) + ".sig").write_bytes(
         assembler.sign(signing_key, program.read_bytes())
     )
-    payload = root / "nas/current/payload.json"
+    payload = root / ("spark/current/linux-arm64/vonk-forge-agent.deb" if kind == "spark" else "nas/current/payload.json")
     payload.write_text('{"schema_version":2}\n')
     Path(str(payload) + ".sig").write_bytes(
         assembler.sign(signing_key, payload.read_bytes())
     )
-    script = root / "bootstraps/nas"
-    script.write_bytes(assembler.bootstrap("nas", public))
+    script = root / "bootstraps" / kind
+    script.write_bytes(assembler.bootstrap(kind, public))
     generation = "a" * 64
     prefix = f"artifacts/dev/releases/{generation}/"
     artifacts = {
@@ -76,11 +79,12 @@ def local_bundle(tmp_path, signing_key):
             {
                 "schema_version": 2,
                 "channel": "dev",
+                "version": "0.1.1~dev.546+g88480698a951",
                 "generation": generation,
                 "artifacts": artifacts,
                 "bootstraps": {
-                    "nas": {
-                        "path": prefix + "bootstraps/nas",
+                    kind: {
+                        "path": prefix + "bootstraps/" + kind,
                         **assembler.record(script.read_bytes()),
                     }
                 },
@@ -186,3 +190,23 @@ def test_setup_uses_uploaded_platform_directory_and_rejects_checksum_drift(tmp_p
     sums.write_text(f"{checksum}  vonk-nas-setup\n" * 2)
     with pytest.raises(ValueError, match="checksum list"):
         assembler.setup_bytes(program)
+
+
+def test_spark_bootstrap_stages_versioned_package(tmp_path, signing_key):
+    script, _, package, _, marker = local_bundle(tmp_path, signing_key, "spark")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uname = bin_dir / "uname"
+    uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo aarch64;; *) exit 1;; esac\n')
+    uname.chmod(0o755)
+    result = subprocess.run(
+        ["/bin/sh", str(script)], capture_output=True, text=True, check=False,
+        env={"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+             "VONK_TEST_MARKER": str(marker)},
+    )
+    assert result.returncode == 0, result.stderr
+    args = marker.read_text().splitlines()
+    assert args[0] == "--package"
+    assert Path(args[1]).name == "vonk-forge-agent_0.1.1~dev.546+g88480698a951_arm64.deb"
+    assert Path(str(marker) + ".package").read_bytes() == package.read_bytes()
+    assert not Path(args[1]).exists()
