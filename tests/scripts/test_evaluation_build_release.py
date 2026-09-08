@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -162,7 +163,7 @@ def test_evaluation_version_sorts_between_physical_and_future_upstream() -> None
     dpkg = shutil.which("dpkg") or ("/usr/bin/dpkg" if Path("/usr/bin/dpkg").exists() else None)
     if dpkg is None:
         return
-    for lower, higher in zip(ordered, ordered[1:]):
+    for lower, higher in pairwise(ordered):
         compared = subprocess.run(
             [dpkg, "--compare-versions", higher, "gt", lower],
             check=False,
