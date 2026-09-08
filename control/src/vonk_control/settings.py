@@ -286,18 +286,7 @@ class Settings:
             if agent_enabled
             else ()
         )
-        try:
-            distributed_start_timeout_seconds = int(
-                os.environ.get("VONK_DISTRIBUTED_START_TIMEOUT_SECONDS", "60")
-            )
-        except ValueError as error:
-            raise SettingsError(
-                "distributed start timeout must be an integer"
-            ) from error
-        if not 60 <= distributed_start_timeout_seconds <= 3600:
-            raise SettingsError(
-                "distributed start timeout must be between 60 and 3600 seconds"
-            )
+        distributed_start_timeout_seconds = _distributed_start_timeout()
         install_channel = os.environ.get("VONK_INSTALL_CHANNEL", "stable")
         if install_channel not in {"dev", "stable"}:
             raise SettingsError("VONK_INSTALL_CHANNEL is invalid")
@@ -603,6 +592,7 @@ class WorkerSettings:
     artifact_job_retention_seconds: int
     artifact_job_reconcile_interval_seconds: int
     artifact_job_reconcile_batch_limit: int
+    distributed_start_timeout_seconds: int = 60
     model_cache_root: Path = Path("/state/model-cache")
     model_cache_reserve_bytes: int = 10 * 1024**3
     model_cache_parallel_downloads: int = 4
@@ -711,6 +701,7 @@ class WorkerSettings:
             )
         return cls(
             database_url=database_url,
+            distributed_start_timeout_seconds=_distributed_start_timeout(),
             deployment_mode=mode,
             management_cidrs=management_cidrs,
             direct_fabric_cidrs=direct_fabric_cidrs,
@@ -733,3 +724,19 @@ class WorkerSettings:
             recipe_build_parallel_preparations=recipe_build_parallel_preparations,
             huggingface_token_path=_optional_secret_path("VONK_HF_TOKEN_FILE"),
         )
+
+
+def _distributed_start_timeout() -> int:
+    try:
+        distributed_start_timeout_seconds = int(
+            os.environ.get("VONK_DISTRIBUTED_START_TIMEOUT_SECONDS", "60")
+        )
+    except ValueError as error:
+        raise SettingsError(
+            "distributed start timeout must be an integer"
+        ) from error
+    if not 60 <= distributed_start_timeout_seconds <= 3600:
+        raise SettingsError(
+            "distributed start timeout must be between 60 and 3600 seconds"
+        )
+    return distributed_start_timeout_seconds
