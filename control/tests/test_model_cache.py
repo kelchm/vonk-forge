@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
@@ -21,6 +22,7 @@ from vonk_control.distribution import (
     ModelCacheVerifiedObjectSource,
 )
 from vonk_control.model_cache import (
+    _CHUNK_BYTES,
     ArtifactSetManifest,
     ArtifactSpec,
     ModelCacheConflict,
@@ -1520,3 +1522,220 @@ def test_large_model_keeps_exact_aggregate_without_truncated_member_list(cache, 
     assert progress["measurement"]["total_items"] == 1025
     assert progress["measurement"]["total_bytes"] == 1025
     assert "members" not in progress["measurement"]
+
+
+class _FragmentedByteStream(httpx.SyncByteStream):
+    def __init__(
+        self,
+        payload: bytes,
+        *,
+        fragment: int,
+        fail_after: int | None = None,
+    ) -> None:
+        self._payload = payload
+        self._fragment = fragment
+        self._fail_after = fail_after
+
+    def __iter__(self):
+        sent = 0
+        while sent < len(self._payload):
+            if self._fail_after is not None and sent >= self._fail_after:
+                raise httpx.ReadTimeout("read timeout")
+            end = min(len(self._payload), sent + self._fragment)
+            yield self._payload[sent:end]
+            sent = end
+
+
+def _http_artifact(payload: bytes, *, model: str = "b" * 64) -> dict[str, object]:
+    return {
+        "id": "weights",
+        "path": "weights.bin",
+        "kind": "http.file",
+        "source": "https://example.test/weights.bin",
+        "revision": "a" * 40,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "download_bytes": len(payload),
+        "roles": ["model"],
+        "model_content_sha256": model,
+    }
+
+
+def _http_cache_service(tmp_path: Path, sessions, handler, *, clock=None):
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    )
+    service = ModelCacheService(
+        sessions,
+        tmp_path / "http-nas-cache",
+        reserve_bytes=0,
+        http_client=client,
+        fixture_sources=True,
+        clock=clock,
+    )
+    return service, client
+
+
+def _track_checkpoint_sessions(service: ModelCacheService):
+    sampled = []
+    writes = {"count": 0}
+    real_checkpoint = service._checkpoint_artifact
+
+    def wrapped(spec, **kwargs):
+        sampled.append(kwargs.get("force_progress", True))
+        real_session = service._session
+
+        @contextmanager
+        def tracking_session(*, write: bool = False):
+            if write:
+                writes["count"] += 1
+            with real_session(write=write) as session:
+                yield session
+
+        service._session = tracking_session
+        try:
+            return real_checkpoint(spec, **kwargs)
+        finally:
+            service._session = real_session
+
+    service._checkpoint_artifact = wrapped
+    return sampled, writes
+
+
+def test_fragmented_http_download_bounds_checkpoints(cache, tmp_path: Path, monkeypatch) -> None:
+    _existing, sessions = cache
+    payload = bytes(range(256)) * ((4 * _CHUNK_BYTES) // 256)
+    fragment = 32
+    assert len(payload) // fragment > 20
+    import vonk_control.model_cache as model_cache_mod
+
+    fsyncs = {"count": 0}
+    real_fsync = model_cache_mod.os.fsync
+
+    def counted_fsync(fd):
+        fsyncs["count"] += 1
+        return real_fsync(fd)
+
+    monkeypatch.setattr(model_cache_mod.os, "fsync", counted_fsync)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_FragmentedByteStream(payload, fragment=fragment),
+        )
+
+    service, client = _http_cache_service(
+        tmp_path, sessions, handler, clock=lambda: NOW
+    )
+    sampled, writes = _track_checkpoint_sessions(service)
+    try:
+        operation = _download(
+            service,
+            [_http_artifact(payload)],
+            model_content_sha256="b" * 64,
+            request_key="00000000-0000-4000-8000-000000000992",
+        )
+        assert operation.state == "succeeded"
+        assert operation.progress["downloaded_bytes"] == len(payload)
+        sampled_progress = sampled.count(False)
+        expected_chunks = (len(payload) + _CHUNK_BYTES - 1) // _CHUNK_BYTES
+        assert sampled_progress <= expected_chunks
+        assert sampled_progress < len(payload) // fragment
+        assert writes["count"] <= 3
+        assert fsyncs["count"] < len(payload) // fragment
+        assert fsyncs["count"] <= expected_chunks + 8
+    finally:
+        service.close()
+        client.close()
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "timeout"])
+def test_fragmented_http_final_progress_is_durable_and_resumes(
+    cache, tmp_path: Path, mode: str
+) -> None:
+    _existing, sessions = cache
+    payload = bytes(range(256)) * ((3 * _CHUNK_BYTES) // 256)
+    durable_after = 2 * _CHUNK_BYTES
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        range_header = request.headers.get("range")
+        if range_header:
+            start = int(range_header.removeprefix("bytes=").split("-", 1)[0])
+            body = payload[start:]
+            end = start + len(body) - 1 if body else start
+            return httpx.Response(
+                206,
+                request=request,
+                content=body,
+                headers={"content-range": f"bytes {start}-{end}/{len(payload)}"},
+            )
+        if mode == "timeout":
+            return httpx.Response(
+                200,
+                request=request,
+                stream=_FragmentedByteStream(
+                    payload, fragment=32, fail_after=durable_after
+                ),
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            stream=_FragmentedByteStream(payload, fragment=32),
+        )
+
+    service, client = _http_cache_service(
+        tmp_path, sessions, handler, clock=lambda: NOW
+    )
+    artifact = _http_artifact(payload)
+    try:
+        preview = service.download_preview(
+            model_content_sha256="b" * 64, artifacts=[artifact]
+        )
+        if mode == "interrupt":
+            interrupted = service.start_download(
+                actor="test",
+                request_key="00000000-0000-4000-8000-000000000993",
+                plan_digest=str(preview["plan_digest"]),
+                model_content_sha256="b" * 64,
+                artifacts=[artifact],
+                interrupt_after_bytes=durable_after,
+            )
+            observed = interrupted
+            assert observed.state == "partial"
+        else:
+            queued = service.start_download(
+                actor="test",
+                request_key="00000000-0000-4000-8000-000000000994",
+                plan_digest=str(preview["plan_digest"]),
+                model_content_sha256="b" * 64,
+                artifacts=[artifact],
+            )
+            service.run_pending()
+            observed = service.get_operation(queued.id)
+            assert observed.state == "queued"
+        part = (
+            service.root
+            / "partials"
+            / str(observed.artifact_set_sha256)
+            / f"{artifact['sha256']}.part"
+        )
+        assert part.stat().st_size == durable_after
+        assert observed.progress["downloaded_bytes"] == durable_after
+        assert observed.progress["downloaded_bytes"] == part.stat().st_size
+        service.run_pending()
+        resumed = service.get_operation(observed.id)
+        assert resumed.state == "succeeded"
+        assert resumed.progress["downloaded_bytes"] == len(payload)
+        assert any(request.headers.get("range") == f"bytes={durable_after}-" for request in requests)
+        assert (
+            service.root
+            / "objects"
+            / str(artifact["sha256"])[0:2]
+            / str(artifact["sha256"])
+        ).read_bytes() == payload
+    finally:
+        service.close()
+        client.close()

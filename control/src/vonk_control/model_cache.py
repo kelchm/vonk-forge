@@ -932,6 +932,7 @@ class ModelCacheService:
         self._background_operations: dict[str, dict[str, object]] = {}
         self._digest_events: dict[str, threading.Event] = {}
         self._hf_cooldown_until: datetime | None = None
+        self._progress_checkpoint_at: dict[str, datetime] = {}
 
     def close(self) -> None:
         """Stop the Controller-wide transfer pool during service shutdown."""
@@ -944,6 +945,7 @@ class ModelCacheService:
         self._upstream_executor.shutdown(wait=False, cancel_futures=True)
         with self._lock:
             self._advance_background_operations()
+            self._progress_checkpoint_at.clear()
 
     @property
     def root(self) -> Path:
@@ -2065,7 +2067,7 @@ class ModelCacheService:
                     "model_cache.range_invalid", "cache source returned an invalid byte range"
                 )
         return (
-            response.iter_bytes(),
+            response.iter_bytes(chunk_size=_CHUNK_BYTES),
             effective_offset,
             lambda: (response.close(), client.close() if owns_client else None),
         )
@@ -2255,83 +2257,89 @@ class ModelCacheService:
         force_progress: bool = True,
     ) -> None:
         now = self._clock()
-        with self._lock, self._session(write=True) as session:
-            operation = session.get(ModelCacheOperation, operation_id, with_for_update=True)
-            if operation is not None and not force_progress:
-                prior = ModelCacheOperationProgress.model_validate(operation.progress).measurement
-                if (prior.phase == "download" and prior.observed_at is not None
-                    and 0 <= (now - datetime.fromisoformat(prior.observed_at)).total_seconds() < 1):
+        with self._lock:
+            if not force_progress:
+                last = self._progress_checkpoint_at.get(operation_id)
+                if last is not None and 0 <= (now - last).total_seconds() < 1:
                     return
-            artifact = session.get(ModelCacheArtifact, spec.sha256)
-            if artifact is not None:
-                artifact.actual_bytes = actual_bytes
-                artifact.state = "partial" if state == "verifying" else state
-                artifact.updated_at = now
-            if operation is not None:
-                manifest = ArtifactSetManifest.from_document(operation.payload["manifest"])
-                payload = dict(operation.payload)
-                raw_transfer = payload.get("transfer")
-                transfer = dict(raw_transfer) if isinstance(raw_transfer, Mapping) else {}
-                raw_artifacts = transfer.get("artifacts")
-                artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, Mapping) else {}
-                raw_entry = artifacts.get(spec.sha256)
-                entry = dict(raw_entry) if isinstance(raw_entry, Mapping) else {}
-                baseline = entry.get("baseline_bytes")
-                baseline = baseline if type(baseline) is int and baseline >= 0 else 0
-                previous_received = entry.get("received_bytes")
-                previous_received = (
-                    previous_received
-                    if type(previous_received) is int and previous_received >= 0
-                    else 0
-                )
-                entry["baseline_bytes"] = baseline
-                entry["received_bytes"] = max(
-                    previous_received, max(0, actual_bytes - baseline)
-                )
-                artifacts[spec.sha256] = entry
-                transfer["schema_version"] = SCHEMA_VERSION
-                transfer["artifacts"] = artifacts
-                total = transfer.get("total_bytes")
-                total = total if type(total) is int and total >= 0 else None
-                received = sum(
-                    value.get("received_bytes", 0)
-                    for value in artifacts.values()
-                    if isinstance(value, Mapping)
-                    and type(value.get("received_bytes")) is int
-                    and value.get("received_bytes", 0) >= 0
-                )
-                payload["transfer"] = transfer
-                claim = payload.get("claim")
-                if isinstance(claim, Mapping) and claim.get("owner") == self._claim_owner:
-                    payload["claim"] = dict(claim) | {
-                        "expires_at": _iso(now + timedelta(seconds=_TRANSFER_CLAIM_SECONDS))
-                    }
-                operation.payload = payload
-                old_progress = operation.progress if isinstance(operation.progress, Mapping) else {}
-                old_downloaded = old_progress.get("downloaded_bytes")
-                old_downloaded = old_downloaded if type(old_downloaded) is int and old_downloaded >= 0 else 0
-                old_completed = old_progress.get("completed_artifacts")
-                old_completed = old_completed if type(old_completed) is int and old_completed >= 0 else 0
-                # A partial file is an active download checkpoint. Only an
-                # interrupted operation should enter the resumable partial state.
-                operation.state = "running"
-                operation.progress = self._progress(
-                    manifest,
-                    previous=operation.progress,
-                    phase="downloading" if state == "partial" else "verifying",
-                    completed_artifacts=max(old_completed, completed_artifacts),
-                    downloaded_bytes=max(old_downloaded, received),
-                    expected_bytes=total,
-                    current_artifact_key=spec.key,
-                    transfer=transfer,
-                )
-                operation.current_artifact_key = spec.key
-                operation.updated_at = now
-            row = session.get(ModelCacheSet, set_digest)
-            if row is not None:
-                row.state = "downloading" if state == "partial" else "verifying"
-                row.verified_bytes = self._verified_bytes(session, set_digest)
-                row.updated_at = now
+            self._progress_checkpoint_at[operation_id] = now
+            with self._session(write=True) as session:
+                operation = session.get(ModelCacheOperation, operation_id, with_for_update=True)
+                if operation is not None and not force_progress:
+                    prior = ModelCacheOperationProgress.model_validate(operation.progress).measurement
+                    if (prior.phase == "download" and prior.observed_at is not None
+                        and 0 <= (now - datetime.fromisoformat(prior.observed_at)).total_seconds() < 1):
+                        return
+                artifact = session.get(ModelCacheArtifact, spec.sha256)
+                if artifact is not None:
+                    artifact.actual_bytes = actual_bytes
+                    artifact.state = "partial" if state == "verifying" else state
+                    artifact.updated_at = now
+                if operation is not None:
+                    manifest = ArtifactSetManifest.from_document(operation.payload["manifest"])
+                    payload = dict(operation.payload)
+                    raw_transfer = payload.get("transfer")
+                    transfer = dict(raw_transfer) if isinstance(raw_transfer, Mapping) else {}
+                    raw_artifacts = transfer.get("artifacts")
+                    artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, Mapping) else {}
+                    raw_entry = artifacts.get(spec.sha256)
+                    entry = dict(raw_entry) if isinstance(raw_entry, Mapping) else {}
+                    baseline = entry.get("baseline_bytes")
+                    baseline = baseline if type(baseline) is int and baseline >= 0 else 0
+                    previous_received = entry.get("received_bytes")
+                    previous_received = (
+                        previous_received
+                        if type(previous_received) is int and previous_received >= 0
+                        else 0
+                    )
+                    entry["baseline_bytes"] = baseline
+                    entry["received_bytes"] = max(
+                        previous_received, max(0, actual_bytes - baseline)
+                    )
+                    artifacts[spec.sha256] = entry
+                    transfer["schema_version"] = SCHEMA_VERSION
+                    transfer["artifacts"] = artifacts
+                    total = transfer.get("total_bytes")
+                    total = total if type(total) is int and total >= 0 else None
+                    received = sum(
+                        value.get("received_bytes", 0)
+                        for value in artifacts.values()
+                        if isinstance(value, Mapping)
+                        and type(value.get("received_bytes")) is int
+                        and value.get("received_bytes", 0) >= 0
+                    )
+                    payload["transfer"] = transfer
+                    claim = payload.get("claim")
+                    if isinstance(claim, Mapping) and claim.get("owner") == self._claim_owner:
+                        payload["claim"] = dict(claim) | {
+                            "expires_at": _iso(now + timedelta(seconds=_TRANSFER_CLAIM_SECONDS))
+                        }
+                    operation.payload = payload
+                    old_progress = operation.progress if isinstance(operation.progress, Mapping) else {}
+                    old_downloaded = old_progress.get("downloaded_bytes")
+                    old_downloaded = old_downloaded if type(old_downloaded) is int and old_downloaded >= 0 else 0
+                    old_completed = old_progress.get("completed_artifacts")
+                    old_completed = old_completed if type(old_completed) is int and old_completed >= 0 else 0
+                    # A partial file is an active download checkpoint. Only an
+                    # interrupted operation should enter the resumable partial state.
+                    operation.state = "running"
+                    operation.progress = self._progress(
+                        manifest,
+                        previous=operation.progress,
+                        phase="downloading" if state == "partial" else "verifying",
+                        completed_artifacts=max(old_completed, completed_artifacts),
+                        downloaded_bytes=max(old_downloaded, received),
+                        expected_bytes=total,
+                        current_artifact_key=spec.key,
+                        transfer=transfer,
+                    )
+                    operation.current_artifact_key = spec.key
+                    operation.updated_at = now
+                row = session.get(ModelCacheSet, set_digest)
+                if row is not None:
+                    row.state = "downloading" if state == "partial" else "verifying"
+                    row.verified_bytes = self._verified_bytes(session, set_digest)
+                    row.updated_at = now
 
     def _mark_artifact_verified(self, spec: ArtifactSpec, set_digest: str) -> None:
         now = self._clock()
