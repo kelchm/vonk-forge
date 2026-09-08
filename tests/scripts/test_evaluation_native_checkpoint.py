@@ -918,3 +918,17 @@ def test_xattr_enumeration_error_is_not_empty_metadata(module, tmp_path, monkeyp
     monkeypatch.setattr(module.os, "listxattr", denied, raising=False)
     with pytest.raises(module.CheckpointError, match="enumerate extended attributes"):
         module.read_captured_xattrs(tmp_path)
+
+
+def test_package_file_list_accepts_dpkg_usr_merge_annotation(module, harness):
+    runtime, world, _ = harness
+    world.package_files = [
+        "/.",
+        "/lib",
+        "diverted by base-files to: /lib.usr-is-merged",
+        "/usr/lib/vonk-forge/vonk-agent",
+    ]
+    assert module.dpkg_file_list(runtime) == ["/lib", "/usr/lib/vonk-forge/vonk-agent"]
+    world.package_files.append("unrecognized dpkg output")
+    with pytest.raises(module.CheckpointError, match="package file list is unsafe"):
+        module.dpkg_file_list(runtime)

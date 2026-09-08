@@ -587,6 +587,15 @@ def dpkg_file_list(runtime: Runtime) -> list[str]:
         line = line.strip()
         if not line or line in {".", "/."}:
             continue
+        # dpkg-query annotates a listed path when another package diverts it
+        # (Ubuntu usr-merge reports /lib this way). The diversion database is
+        # captured separately with all dpkg state; this line is not a file.
+        diversion = re.fullmatch(
+            r"diverted by [a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)? to: (/.*)", line
+        )
+        if diversion is not None and paths:
+            posix(diversion.group(1))
+            continue
         if not line.startswith("/"):
             raise CheckpointError("package file list is unsafe")
         paths.append(posix(line))
