@@ -397,9 +397,11 @@ def persist_runtime_image_receipt(
             "runtime_image.authorization_invalid",
             "current recipe execution identity does not match the immutable receipt",
         )
-    # The original active revision can authorize its separately compiled ranks
-    # over the same verified bytes. Editorial successors may only reuse an
-    # existing original execution binding; they cannot mint a new one.
+    # Original active revisions may authorize separately compiled ranks and
+    # parameterized executions over the same verified bytes. Editorial
+    # successors can reuse exact bindings, but cannot extend an existing
+    # artifact's binding set. Successor-first distributed preparation remains
+    # unsupported until that reuse context can be validated independently.
     identity = {
         "registry_manifest_digest": receipt.registry_manifest_digest,
         "platform_manifest_digest": receipt.platform_manifest_digest,
