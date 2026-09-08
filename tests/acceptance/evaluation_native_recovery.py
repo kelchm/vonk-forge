@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 from collections.abc import Mapping, Sequence
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -456,6 +457,25 @@ def stop_native_units(units: Sequence[str]) -> None:
         require(["/usr/bin/systemctl", "--system", "stop", "--", unit], sudo=True)
 
 
+def wait_for_package_finisher(paths: Sequence[str]) -> None:
+    # dpkg's postinst schedules helper activation after dpkg releases its lock.
+    # Let that supported finisher complete before quiescing native services.
+    deadline = time.monotonic() + 90
+    while True:
+        pending = [
+            path
+            for path in paths
+            if run(["/usr/bin/test", "-e", path], sudo=True).returncode == 0
+        ]
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise LifecycleError(
+                "package activation did not finish: " + ", ".join(pending)
+            )
+        time.sleep(1)
+
+
 def prepare_stopped_runtime() -> None:
     # systemd removes RuntimeDirectory when the agent stops. Offline rootless
     # Podman inspection still requires that private runtime directory.
@@ -563,6 +583,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
             timeout=300,
         )
     apt_install(baseline.deb)
+    wait_for_package_finisher(helper.PENDING_RECOVERY_PATHS)
     fixtures = Path(arguments.output).resolve().parent / "native-recovery-fixtures"
     fixtures.mkdir(mode=0o700, exist_ok=True)
     toml_path, cred_path, sqlite_path = (
@@ -622,6 +643,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     ):
         raise LifecycleError("checkpoint identity does not match the baseline package")
     apt_install(artifacts.package)
+    wait_for_package_finisher(helper.PENDING_RECOVERY_PATHS)
     stop_native_units(helper.NATIVE_UNITS)
     prepare_stopped_runtime()
     require_quiescent(candidate_version, helper.SQLITE_PATHS)

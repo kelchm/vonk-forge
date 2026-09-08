@@ -389,6 +389,7 @@ def test_recover_mocked_success_is_not_native_bootstrap_evidence(
         "tests.acceptance.evaluation_native_recovery.load_script",
         lambda *_args: SimpleNamespace(
             NATIVE_UNITS=("vonk-forge-agent.service",),
+            PENDING_RECOVERY_PATHS=(),
             SQLITE_PATHS=("/var/lib/vonk-forge-agent/state.sqlite",),
         ),
     )
