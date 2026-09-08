@@ -755,10 +755,18 @@ class EvaluationLocalLifecycle(SparkLifecycle):
         interactive=run_interactive,
     ) -> str:
         assert self.temporary_root is not None
+        # The signed object graph uses a canonical generic name; native setup
+        # requires the normal versioned DEB filename and verifies its contents.
+        package = self.temporary_root / (
+            f"vonk-forge-agent_{self.arguments.version}_arm64.deb"
+        )
+        with package.open("xb") as output:
+            output.write(self.artifacts.package.read_bytes())
+        package.chmod(0o600)
         return interactive(
             native_spark_setup_command(
                 spark_setup=self.artifacts.spark_setup,
-                package=self.artifacts.package,
+                package=package,
                 release=self.artifacts.release,
                 signature=self.artifacts.signature,
                 setup_signature=self.artifacts.spark_setup_signature,
