@@ -58,7 +58,10 @@ jobs:
           BUNDLE_SHA256: ${{ inputs.bundle_sha256 }}
         run: |
           set -euo pipefail
-          test "$BUNDLE_TAG" = "evaluation/$GITHUB_SHA"
+          source=${BUNDLE_TAG#evaluation/}
+          [[ "$source" =~ ^[0-9a-f]{40}$ ]]
+          test "$BUNDLE_TAG" = "evaluation/$source"
+          echo "VONK_EVALUATION_CANDIDATE_SOURCE=$source" >> "$GITHUB_ENV"
           [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           gh release download "$BUNDLE_TAG" --repo kelchm/vonk-forge \
             --pattern evaluation-bundle.tar --dir "$RUNNER_TEMP/evaluation-input"
@@ -109,13 +112,13 @@ jobs:
           generation=$(jq -er .generation "$bundle/assembly.json")
           source=$(jq -er .source "$bundle/assembly.json")
           version=$(jq -er .version "$bundle/assembly.json")
-          test "$source" = "$GITHUB_SHA"
+          test "$source" = "$VONK_EVALUATION_CANDIDATE_SOURCE"
           [[ "$generation" =~ ^[0-9a-f]{64}$ ]]
           release="$bundle/objects/artifacts/dev/releases/$generation/release.json"
           export VONK_ACCEPTANCE_COMPOSE_OVERLAY="$bundle/compose-overlay.yml"
           mkdir -p "$RUNNER_TEMP/evaluation-proof"
           uv run --with-editable "$VONK_RECIPE_LIBRARY_ROOT/contracts" \
-            python tests/acceptance/evaluation_local_release.py run \
+            python -m tests.acceptance.evaluation_local_release run \
               --candidate-release "$release" --object-root "$bundle/objects" \
               --installer-public-key install/installer-release-public.pem \
               --compose-overlay "$bundle/compose-overlay.yml" \

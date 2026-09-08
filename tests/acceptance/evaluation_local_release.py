@@ -808,6 +808,7 @@ class EvaluationLocalLifecycle(SparkLifecycle):
             "direct_agent_health": self._direct_agent_health(),
             "evaluation": {
                 "boundary": "disposable-fork",
+                "harness_source": os.environ.get("GITHUB_SHA", ""),
                 "origin": self.origin,
                 "publication_acceptance": False,
             },
