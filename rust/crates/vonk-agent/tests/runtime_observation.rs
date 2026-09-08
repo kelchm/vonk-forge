@@ -363,7 +363,14 @@ fn retained_single_inspection_keeps_resolved_endpoint_and_bridge_network() {
         .unwrap();
     let plans = runtime.recipe_run_inspection_plans().unwrap();
     assert_eq!(plans.len(), 1);
-    assert_eq!(plans[0].arguments, started.main);
+    let mut expected = vec![
+        started.archive_sha256,
+        started.registry_index_digest,
+        started.platform_manifest_digest,
+        started.image_reference,
+    ];
+    expected.extend(started.main);
+    assert_eq!(plans[0].arguments, expected);
     assert!(
         plans[0]
             .arguments
