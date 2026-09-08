@@ -8,6 +8,7 @@ from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -265,7 +266,7 @@ class _TargetExecutor(CompositeDistributionPhaseExecutor):
         )
 
 
-def _seed() -> tuple[sessionmaker[Session], str, str, str]:
+def _seed(node_count: int = 1) -> tuple[sessionmaker[Session], str, str, str]:
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -279,6 +280,14 @@ def _seed() -> tuple[sessionmaker[Session], str, str, str]:
         .joinpath("examples", "model-definition.json")
         .read_text()
     )
+    if node_count == 2:
+        recipe_document["topology"] = canonical_example("recipe-dual.json")["topology"]
+        recipe_document["models"][0]["files"][0]["roles"] = ["entrypoint", "worker"]
+        recipe_document["topology"]["mode"] = "distributed"
+        recipe_document["topology"]["parallelism"]["backend"] = "mp"
+        recipe_document["runtime"]["lifecycle"]["failure"] = {
+            "rank_loss": "withdraw-endpoint", "recovery": "restart-worker-then-entrypoint"
+        }
     recipe_document = RecipeDefinition.model_validate(recipe_document).model_dump(mode="json")
     model_document = ModelDefinition.model_validate(model_document).model_dump(mode="json")
     recipe_digest = content_sha256(RecipeDefinition.model_validate(recipe_document))
@@ -364,30 +373,45 @@ def _seed() -> tuple[sessionmaker[Session], str, str, str]:
                 ),
             ]
         )
-    InventoryRepository(sessions, clock=lambda: NOW).record(
-        InventorySnapshotInput(
-            node_id=NODE_ID,
-            observed_at=NOW,
-            disk_total_bytes=10_000_000_000,
-            disk_free_bytes=10_000_000_000,
-            host_memory_total_bytes=10_000_000_000,
-            host_memory_free_bytes=10_000_000_000,
-            gpu_memory_total_bytes=10_000_000_000,
-            gpu_memory_free_bytes=10_000_000_000,
-            gpu_count=1,
-            artifact_store_read_only=False,
-            capabilities=("runtime.vonk.v1", "recipe.operations.v1"),
+    node_ids = [NODE_ID]
+    if node_count == 2:
+        second = "spk_" + "2" * 32
+        node_ids.append(second)
+        with sessions.begin() as session:
+            session.add(AgentNode(node_id=second, state="active", architecture="linux-arm64",
+                capabilities=["runtime.vonk.v1", "recipe.operations.v1"]))
+            session.flush()
+            session.add(AgentCertificate(serial="serial-second", node_id=second,
+                fingerprint="fingerprint-second", not_before=NOW, not_after=NOW.replace(year=2027)))
+            session.add(AgentPresence(node_id=second, certificate_serial="serial-second",
+                certificate_fingerprint="fingerprint-second", management_address="10.0.0.43", observed_at=NOW))
+    for index, node_id in enumerate(node_ids):
+        InventoryRepository(sessions, clock=lambda: NOW).record(
+            InventorySnapshotInput(
+                node_id=node_id,
+                observed_at=NOW,
+                disk_total_bytes=10_000_000_000,
+                disk_free_bytes=10_000_000_000,
+                host_memory_total_bytes=10_000_000_000,
+                host_memory_free_bytes=10_000_000_000,
+                gpu_memory_total_bytes=10_000_000_000,
+                gpu_memory_free_bytes=10_000_000_000,
+                gpu_count=1,
+                artifact_store_read_only=False,
+                capabilities=("runtime.vonk.v1", "recipe.operations.v1", "fabric.connected.mbps.1000"),
+                fabric_address=f"192.168.100.{index+2}" if node_count == 2 else None,
+                fabric_bandwidth_mbps=1000 if node_count == 2 else None,
+            )
         )
-    )
     mapping_service = ClusterMappingService(sessions)
-    mapping_plan = mapping_service.preview(revision_id, (NODE_ID,), {}, "test")
+    mapping_plan = mapping_service.preview(revision_id, tuple(node_ids), {}, "test")
     mapping_id = mapping_service.materialize(mapping_plan, actor="test", now=NOW)
     record_passing_preflight(sessions, NOW, floor=10)
     return sessions, revision_id, recipe_digest, mapping_id
 
 
-def _make_service(tmp_path: Path, *, persist_db: bool = True, tamper_db: str | None = None):
-    sessions, revision_id, recipe_digest, mapping_id = _seed()
+def _make_service(tmp_path: Path, *, persist_db: bool = True, tamper_db: str | None = None, node_count: int = 1):
+    sessions, revision_id, recipe_digest, mapping_id = _seed(node_count)
     storage = FilesystemRuntimeImageStorage(tmp_path / "runtime")
     events: list[str] = []
 
@@ -480,21 +504,22 @@ def _make_service(tmp_path: Path, *, persist_db: bool = True, tamper_db: str | N
     return service, sessions, revision_id, recipe_digest, mapping_id, executor, events
 
 
+@pytest.mark.parametrize("node_count", [1, 2])
 def test_direct_published_image_real_run_switch_path_persists_receipt_before_compile_and_uses_platform_identity(
-    tmp_path: Path,
+    tmp_path: Path, node_count: int,
 ) -> None:
-    service, sessions, revision_id, recipe_digest, mapping_id, executor, events = _make_service(tmp_path)
+    service, sessions, revision_id, recipe_digest, mapping_id, executor, events = _make_service(tmp_path, node_count=node_count)
     del mapping_id
     request = RunSwitchPreviewRequest(
         model_content_sha256="e1e9de42be3e14bdb392cba65c9bbcbec6a4ea5b448597e0c32d187c5840029c",
         recipe_revision_id=revision_id,
         spark_group=SparkGroup(
-            nodes=[SparkGroupNode(node_id=NODE_ID, rank=0, role="entrypoint", endpoint_owner=True)]
+            nodes=[SparkGroupNode(node_id=NODE_ID, rank=0, role="entrypoint", endpoint_owner=True)] + ([SparkGroupNode(node_id="spk_"+"2"*32, rank=1, role="worker", endpoint_owner=False)] if node_count == 2 else [])
         ),
         alias="synthetic-tiny",
     )
     preview = service.preview(request, actor="test")
-    assert preview.allowed is True
+    assert preview.allowed is True, preview.blockers
     assert preview.recipe_build_id is None
     assert all(phase.subphase != "container-build" for phase in preview.phases)
     operation = service.apply(
@@ -537,7 +562,7 @@ def test_direct_published_image_real_run_switch_path_persists_receipt_before_com
         assert compiled["runtime_image"]["local_image_config_id"] == CONFIG_DIGEST
         assert compiled["runtime_image"]["distribution_object"]["sha256"] == ARCHIVE_DIGEST
         assert session.query(RecipeBuild).count() == 0
-        assert session.query(RuntimeImageReceipt).count() == 1
+        assert session.query(RuntimeImageReceipt).count() == node_count
         persisted = session.scalar(select(RuntimeImageReceipt))
         assert persisted is not None
         assert persisted.original_content_digest == recipe_digest
@@ -568,6 +593,16 @@ def test_direct_published_image_real_run_switch_path_persists_receipt_before_com
     response = _read_spec_endpoint(sessions, tmp_path, installation_id)
     assert response.status_code == 200
     assert response.json() == compiled_spec
+    if node_count == 2:
+        with sessions() as session:
+            installation = session.get(RecipeInstallation, installation_id)
+            second_spec = installation.plan["compiled_execution_plans"]["spk_"+"2"*32]
+        assert second_spec["identity"]["execution_sha256"] != compiled_spec["identity"]["execution_sha256"]
+        assert second_spec["runtime_image"] == compiled_spec["runtime_image"]
+        response = _read_spec_endpoint(sessions, tmp_path, installation_id, second=True)
+        assert response.status_code == 200, response.text
+        assert response.json() == second_spec
+
     assert response.json()["runtime_image"]["registry_manifest_digest"] == REGISTRY_DIGEST
     assert response.json()["runtime_image"]["platform_manifest_digest"] == PLATFORM_DIGEST
 
@@ -597,7 +632,7 @@ class _NoopJobs:
         raise AssertionError("the installation spec route must not enqueue work")
 
 
-def _read_spec_endpoint(sessions: sessionmaker[Session], tmp_path: Path, installation_id: str):
+def _read_spec_endpoint(sessions: sessionmaker[Session], tmp_path: Path, installation_id: str, *, second: bool = False):
     presence = AgentPresenceService(
         sessions,
         ManagementAddressPolicy.parse("10.0.0.0/24"),
@@ -615,7 +650,7 @@ def _read_spec_endpoint(sessions: sessionmaker[Session], tmp_path: Path, install
         artifact_root=root / "artifacts",
         source_bundles=SourceBundleStore(root / "source-bundles"),
     )
-    services.artifact_root.mkdir(parents=True)
+    services.artifact_root.mkdir(parents=True, exist_ok=True)
     app = create_app(
         jobs=_NoopJobs(),
         tokens=TokenCodec(b"k" * 32),
@@ -625,12 +660,12 @@ def _read_spec_endpoint(sessions: sessionmaker[Session], tmp_path: Path, install
         trusted_agent_proxy_auth=b"p" * 32,
     )
     headers = {
-        "x-vonk-agent-node": NODE_ID,
-        "x-vonk-agent-serial": "serial-direct",
-        "x-vonk-agent-fingerprint": "fingerprint-direct",
+        "x-vonk-agent-node": "spk_"+"2"*32 if second else NODE_ID,
+        "x-vonk-agent-serial": "serial-second" if second else "serial-direct",
+        "x-vonk-agent-fingerprint": "fingerprint-second" if second else "fingerprint-direct",
         "x-vonk-agent-verified": "1",
         "x-vonk-agent-proxy-auth": "p" * 32,
-        "x-vonk-agent-source": "10.0.0.42",
+        "x-vonk-agent-source": "10.0.0.43" if second else "10.0.0.42",
     }
     with TestClient(app) as client:
         return client.get(
