@@ -2389,7 +2389,19 @@ class SparkLifecycle:
             raise LifecycleError("synthetic serving request body is invalid")
         responses: list[dict[str, object]] = []
         for _attempt in range(2):
-            status, payload = inference.request("POST", str(request["path"]), body)
+            diagnostic = os.environ.get("VONK_EVALUATION_OBSERVATION_DIAGNOSTIC") == "1"
+            status, payload = inference.request(
+                "POST", str(request["path"]), body,
+                allowed=(200, 201, 202, 400) if diagnostic else (200, 201, 202),
+            )
+            if status == 400:
+                detail = json.dumps(payload)
+                for value in inference._headers.values():
+                    if value:
+                        detail = detail.replace(value, "<redacted>")
+                        detail = detail.replace(value.removeprefix("Bearer "), "<redacted>")
+                detail = re.sub(r"sk-[A-Za-z0-9_-]+", "<redacted-key>", detail)
+                raise LifecycleError("synthetic inference HTTP400: " + SparkLifecycle._redact_diagnostics(detail, limit=1500))
             response = require_object(payload, "synthetic serving response")
             evaluate_http_response(
                 HttpObservation(status=status, headers={}, body=_canonical(response)),
