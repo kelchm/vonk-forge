@@ -167,6 +167,7 @@ class Settings:
     # configured.
     recipe_library_package_url: str | None = None
     recipe_library_sync_interval_seconds: int = 900
+    distributed_start_timeout_seconds: int = 60
     agent_release_api_url: str = "https://install.vonkforge.ai"
     agent_controller_address: str | None = None
     agent_service_hostnames: tuple[str, ...] = ()
@@ -285,6 +286,18 @@ class Settings:
             if agent_enabled
             else ()
         )
+        try:
+            distributed_start_timeout_seconds = int(
+                os.environ.get("VONK_DISTRIBUTED_START_TIMEOUT_SECONDS", "60")
+            )
+        except ValueError as error:
+            raise SettingsError(
+                "distributed start timeout must be an integer"
+            ) from error
+        if not 60 <= distributed_start_timeout_seconds <= 3600:
+            raise SettingsError(
+                "distributed start timeout must be between 60 and 3600 seconds"
+            )
         install_channel = os.environ.get("VONK_INSTALL_CHANNEL", "stable")
         if install_channel not in {"dev", "stable"}:
             raise SettingsError("VONK_INSTALL_CHANNEL is invalid")
@@ -558,6 +571,7 @@ class Settings:
             recipe_library_api_url=recipe_library_api_url,
             recipe_library_package_url=recipe_library_package_url,
             recipe_library_sync_interval_seconds=recipe_library_sync_interval_seconds,
+            distributed_start_timeout_seconds=distributed_start_timeout_seconds,
             agent_release_api_url=agent_release_api_url,
             agent_controller_address=agent_controller_address,
             agent_service_hostnames=agent_service_hostnames,

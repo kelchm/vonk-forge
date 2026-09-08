@@ -334,6 +334,7 @@ def assemble_production_worker(
         route_publications=recipe_routes,
         builds=recipe_builds,
         mappings=ClusterMappingService(sessions),
+        distributed_start_timeout_seconds=settings.distributed_start_timeout_seconds,
     )
     run_switch_operations = RunSwitchOperationService(
         sessions,
