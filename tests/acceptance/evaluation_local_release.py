@@ -783,6 +783,24 @@ class EvaluationLocalLifecycle(SparkLifecycle):
             forbidden_values=[pairing_token],
         )
 
+    def _installation_failure(self, stage: str, error: Exception) -> LifecycleError:
+        failure = super()._installation_failure(stage, error)
+        sections = [str(failure)]
+        # Keep each service's validation error intact; the shared 2K tail can
+        # retain only the final stack frames and hide the rejected field.
+        if self.bundle is not None:
+            for service in ("control-api", "control-worker"):
+                logs = self._diagnostic_command(
+                    self._compose("logs", "--no-color", "--tail", "160", service)
+                )
+                if logs is not None:
+                    sections.append(
+                        service + " diagnostics:\n" + self._redact_diagnostics(
+                            logs.stdout or logs.stderr, limit=16000
+                        )
+                    )
+        return LifecycleError("\n".join(sections))
+
     def observe(self) -> dict[str, object]:
         if self.control is None or self.bundle is None or self.temporary_root is None:
             raise LifecycleError("candidate controller is not ready")
