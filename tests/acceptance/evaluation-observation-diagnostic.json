@@ -1,0 +1,11 @@
+{
+  "services": {
+    "control-api": {
+      "command": [
+        "python",
+        "-c",
+        "import json\nimport uvicorn\nfrom vonk_control.api import production_app\napp = production_app()\nallowed = {\n \"recipe run observation time must be timezone-aware\",\n \"recipe run observation time is outside the accepted window\",\n \"recipe run observation is not assigned\",\n \"recipe run observation node is unavailable\",\n \"recipe run observation receipt key is stale\",\n \"recipe run observation generation is stale\",\n \"recipe run observation was replayed\",\n}\ndef wrap(handler):\n async def diagnostic(request, error):\n  if request.url.path.endswith(\"/recipe-runs/observations\"):\n   detail = getattr(error, \"detail\", None)\n   record = {\"error_type\": type(error).__name__, \"status\": getattr(error, \"status_code\", None), \"reason\": detail if isinstance(detail, str) and detail in allowed else \"unclassified\"}\n   if hasattr(error, \"errors\"):\n    record[\"validation\"] = [{\"type\": e[\"type\"], \"loc\": list(e[\"loc\"])} for e in error.errors()][:8]\n   print(\"EVALUATION_OBSERVATION_REJECTION \" + json.dumps(record), flush=True)\n  return await handler(request, error)\n return diagnostic\nfor kind, handler in list(app.exception_handlers.items()):\n app.add_exception_handler(kind, wrap(handler))\nuvicorn.run(app, host=\"0.0.0.0\", port=8000, access_log=False)\n"
+      ]
+    }
+  }
+}

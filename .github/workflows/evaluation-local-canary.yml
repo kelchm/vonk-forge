@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 45
     env:
       VONK_EVALUATION_DISPOSABLE: "1"
+      VONK_EVALUATION_OBSERVATION_DIAGNOSTIC: "1"
       VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
       VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
       VONK_ACCEPTANCE_SPARK_CONTROLLER_BOUNDARY: loopback

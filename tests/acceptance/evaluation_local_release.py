@@ -577,6 +577,18 @@ class EvaluationLocalLifecycle(SparkLifecycle):
             "docker-compose.yaml",
             "-f",
             os.fspath(self.compose_overlay),
+            *(
+                [
+                    "-f",
+                    str(
+                        Path(__file__).with_name(
+                            "evaluation-observation-diagnostic.json"
+                        )
+                    ),
+                ]
+                if os.environ.get("VONK_EVALUATION_OBSERVATION_DIAGNOSTIC") == "1"
+                else []
+            ),
             *arguments,
         ]
 
@@ -795,7 +807,9 @@ class EvaluationLocalLifecycle(SparkLifecycle):
                 )
                 if logs is not None:
                     sections.append(
-                        service + " diagnostics:\n" + self._redact_diagnostics(
+                        service
+                        + " diagnostics:\n"
+                        + self._redact_diagnostics(
                             logs.stdout or logs.stderr, limit=16000
                         )
                     )
@@ -837,6 +851,10 @@ class EvaluationLocalLifecycle(SparkLifecycle):
                 "harness_source": os.environ.get("GITHUB_SHA", ""),
                 "origin": self.origin,
                 "publication_acceptance": False,
+                "observation_diagnostic": os.environ.get(
+                    "VONK_EVALUATION_OBSERVATION_DIAGNOSTIC"
+                )
+                == "1",
             },
             "installation": {
                 "architecture": "arm64",
