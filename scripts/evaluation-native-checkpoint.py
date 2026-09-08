@@ -169,7 +169,7 @@ NOTES = (
     "Not a full OS snapshot and not disaster recovery.",
     "Does not restore Controller CA/server state or start services.",
     "Does not use dpkg --force-downgrade or rewrite package versions.",
-    "Immutable model/image caches stay in place.",
+    "Model/image and retained run output caches stay in place; cache bytes are not backed up.",
     "APT transitions that change non-Vonk packages are refused; root should apt-get --simulate before apply.",
 )
 
@@ -307,6 +307,11 @@ def immutable_path(absolute: str) -> bool:
     if not parts:
         return False
     if parts[0] in IMMUTABLE_TOPLEVEL:
+        return True
+    # Native package recovery leaves model/image bytes and regenerable model
+    # caches in place. Real PLE caches can be tens of GB; they are not package
+    # authority or operational SQLite state and must never be removed here.
+    if len(parts) >= 4 and parts[0] == "runs" and parts[2:4] == ("outputs", "cache"):
         return True
     return len(parts) >= 3 and parts[0] == "installations" and parts[2] == "models"
 

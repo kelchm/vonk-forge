@@ -419,9 +419,13 @@ def test_checkpoint_and_apply_restore_fixture_bytes(
     output = world.root / "var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model"
     output.mkdir(parents=True)
     os.symlink("/models/weights.bin", output / "weights.bin")
+    cache = output.parent / "cache/ple/weights"
+    write(cache, b"retained model cache")
     report = checkpoint_ok(module, runtime, checkpoint_dir)
     metadata = json.loads((checkpoint_dir / "metadata.json").read_text())
     member_paths = {item["path"] for item in metadata["members"]}
+    assert "/" + str(cache.relative_to(world.root)) not in member_paths
+    assert not module.allowed_extra_removal("/" + str(cache.relative_to(world.root)))
     assert "/usr/share/keyrings/vonk-forge-release.pub" in member_paths
     assert "/etc/vonk-forge-agent/controller-ca.pem" not in member_paths
     assert "/var/lib/vonk-forge-agent/models/weights.bin" not in member_paths
@@ -471,6 +475,7 @@ def test_checkpoint_and_apply_restore_fixture_bytes(
     assert (root / "usr/lib/vonk-forge/agent-link").is_symlink()
     assert os.readlink(root / "usr/lib/vonk-forge/agent-link") == "vonk-agent"
     assert os.readlink(output / "weights.bin") == "/models/weights.bin"
+    assert cache.read_bytes() == b"retained model cache"
     assert not (root / "usr/lib/vonk-forge/new-tool").exists()
     assert not (root / "usr/lib/vonk-forge/not-in-dpkg").exists()
     assert not (root / "etc/vonk-forge-agent/extra-candidate.conf").exists()
