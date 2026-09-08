@@ -2177,6 +2177,11 @@ class SparkLifecycle:
             completed.append("stopped")
             self._await_canary_endpoint(fixture.slug, published=False)
             completed.append("route-withdrawn")
+            retained = self._retained_canary_evidence(
+                completed, response_digest, installation_id
+            )
+            if retained is not None:
+                return retained
             _, uninstall_preview_payload = self.control.request(
                 "POST",
                 "/api/v1/recipes/uninstall-plans/preview",
@@ -2231,6 +2236,12 @@ class SparkLifecycle:
             "completed_states": completed,
             "deterministic_response_sha256": response_digest,
         }
+
+    def _retained_canary_evidence(
+        self, completed: list[str], response_digest: object, installation_id: str
+    ) -> dict[str, object] | None:
+        # Ordinary publication acceptance always continues through uninstall.
+        return None
 
     @staticmethod
     def _canary_request_key(

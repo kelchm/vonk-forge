@@ -52,6 +52,8 @@ from tests.acceptance.test_spark_lifecycle import (
     REGISTRY_HOST,
     SHA256,
     SOURCE_SHA,
+    SYNTHETIC_CANARY_STATES,
+    UUID,
     VERSION,
     LifecycleError,
     LocalBrowserController,
@@ -519,6 +521,27 @@ def verify_local_signed_release(arguments: argparse.Namespace) -> LocalReleaseAr
 class EvaluationLocalLifecycle(SparkLifecycle):
     """Candidate synthetic lifecycle against local signed fork artifacts."""
 
+    def _retained_canary_evidence(
+        self, completed: list[str], response_digest: object, installation_id: str
+    ) -> dict[str, object] | None:
+        if not getattr(self.arguments, "retain_installation", False):
+            return None
+        if (
+            completed != list(SYNTHETIC_CANARY_STATES[:-1])
+            or not isinstance(response_digest, str)
+            or SHA256.fullmatch(response_digest) is None
+            or UUID.fullmatch(installation_id) is None
+        ):
+            raise LifecycleError("retained installation canary evidence is incomplete")
+        return {
+            "profile": "retained-installation",
+            "completed_states": list(completed),
+            "deterministic_response_sha256": response_digest,
+            "retained_installation_id": installation_id,
+            "uninstall_qualified": False,
+            "full_lifecycle_acceptance": False,
+        }
+
     def __init__(
         self,
         arguments: argparse.Namespace,
@@ -855,6 +878,11 @@ class EvaluationLocalLifecycle(SparkLifecycle):
                 ),
                 "origin": self.origin,
                 "publication_acceptance": False,
+                "qualification_profile": (
+                    "retained-installation"
+                    if getattr(self.arguments, "retain_installation", False)
+                    else "full-canary"
+                ),
                 "observation_diagnostic": os.environ.get(
                     "VONK_EVALUATION_OBSERVATION_DIAGNOSTIC"
                 )
@@ -909,6 +937,7 @@ def _arguments() -> argparse.Namespace:
     run.add_argument("--run-id", type=int, required=True)
     run.add_argument("--platform", required=True)
     run.add_argument("--origin", default=EVALUATION_ORIGIN)
+    run.add_argument("--retain-installation", action="store_true")
     return parser.parse_args()
 
 

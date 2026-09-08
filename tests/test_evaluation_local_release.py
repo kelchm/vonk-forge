@@ -521,3 +521,35 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
     assert observed["forbidden_values"] == [token]
     assert token not in repr(observed["command"])
     assert token not in repr(observed["environment"])
+
+
+@pytest.mark.parametrize("missing", range(11))
+def test_retained_profile_rejects_missing_lifecycle_evidence(missing):
+    from tests.acceptance.test_spark_lifecycle import SYNTHETIC_CANARY_STATES
+
+    run = object.__new__(EvaluationLocalLifecycle)
+    run.arguments = SimpleNamespace(retain_installation=True)
+    completed = list(SYNTHETIC_CANARY_STATES[:-1])
+    completed.pop(missing)
+    with pytest.raises(LifecycleError, match="evidence is incomplete"):
+        run._retained_canary_evidence(completed, "a" * 64, "12345678-1234-4234-8234-123456789abc")
+
+
+def test_retained_profile_is_explicit_and_never_claims_uninstall():
+    from tests.acceptance.test_spark_lifecycle import (
+        SYNTHETIC_CANARY_STATES,
+        SparkLifecycle,
+    )
+
+    run = object.__new__(EvaluationLocalLifecycle)
+    run.arguments = SimpleNamespace(retain_installation=True)
+    completed = list(SYNTHETIC_CANARY_STATES[:-1])
+    identity = "12345678-1234-4234-8234-123456789abc"
+    proof = run._retained_canary_evidence(completed, "a" * 64, identity)
+    assert proof["retained_installation_id"] == identity
+    assert proof["uninstall_qualified"] is False
+    assert proof["full_lifecycle_acceptance"] is False
+    assert "uninstalled" not in proof["completed_states"]
+    run.arguments = SimpleNamespace()
+    assert run._retained_canary_evidence(completed, "a" * 64, identity) is None
+    assert SparkLifecycle._retained_canary_evidence(run, completed, "a" * 64, identity) is None

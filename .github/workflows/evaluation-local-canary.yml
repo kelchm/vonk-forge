@@ -12,6 +12,11 @@ on:
         description: Exact evaluation-bundle.tar SHA256
         required: true
         type: string
+      retain_installation:
+        description: Qualify retained run/stop path only; uninstall remains unqualified
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 jobs:
@@ -21,7 +26,7 @@ jobs:
     timeout-minutes: 45
     env:
       VONK_EVALUATION_DISPOSABLE: "1"
-      VONK_EVALUATION_OBSERVATION_DIAGNOSTIC: "1"
+      VONK_EVALUATION_OBSERVATION_DIAGNOSTIC: "0"
       VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
       VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
       VONK_ACCEPTANCE_SPARK_CONTROLLER_BOUNDARY: loopback
@@ -107,6 +112,8 @@ jobs:
           sudo systemctl restart docker.service
           docker info --format '{{json .CDISpecDirs}}' | jq -e 'index("/etc/cdi") != null and index("/var/run/cdi") != null' >/dev/null
       - name: Exercise signed native installation and Vonk model lifecycle
+        env:
+          RETAIN_INSTALLATION: ${{ inputs.retain_installation }}
         run: |
           set -euo pipefail
           test "$(git -C "$VONK_RECIPE_LIBRARY_ROOT" rev-parse HEAD)" = "$(cat tests/acceptance/evaluation-recipe-library-revision.txt)"
@@ -119,6 +126,10 @@ jobs:
           release="$bundle/objects/artifacts/dev/releases/$generation/release.json"
           export VONK_ACCEPTANCE_COMPOSE_OVERLAY="$bundle/compose-overlay.yml"
           mkdir -p "$RUNNER_TEMP/evaluation-proof"
+          profile_args=()
+          if [[ "$RETAIN_INSTALLATION" == "true" ]]; then
+            profile_args+=(--retain-installation)
+          fi
           uv run --with-editable "$VONK_RECIPE_LIBRARY_ROOT/contracts" \
             python -m tests.acceptance.evaluation_local_release run \
               --candidate-release "$release" --object-root "$bundle/objects" \
@@ -126,7 +137,7 @@ jobs:
               --compose-overlay "$bundle/compose-overlay.yml" \
               --channel dev --version "$version" --source-sha "$source" \
               --generation "$generation" --run-id "$GITHUB_RUN_ID" --platform linux-arm64 \
-              --output "$RUNNER_TEMP/evaluation-proof/report.json"
+              --output "$RUNNER_TEMP/evaluation-proof/report.json" "${profile_args[@]}"
       - name: Retain bounded lifecycle proof
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
