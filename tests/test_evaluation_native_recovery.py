@@ -374,7 +374,7 @@ def test_recover_mocked_success_is_not_native_bootstrap_evidence(
             )
         if program == "cat":
             return subprocess.CompletedProcess(argv, 0, b"11" * 32 + b"\n", b"")
-        if program in {"install", "apt-get", "test"}:
+        if program in {"install", "apt-get", "test", "ip"}:
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         raise AssertionError(argv)
 

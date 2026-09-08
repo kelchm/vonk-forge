@@ -63,6 +63,14 @@ FIXTURE_TOML = b'node_id = "spk_00000000000000000000000000000001"\n'
 FIXTURE_AUTHORITY = (
     b"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\n"
 )
+FIXTURE_FIREWALL = b"""VONK_NAS_MANAGEMENT_IP=198.18.250.2
+VONK_NODE_MANAGEMENT_IP=198.18.250.1
+VONK_NODE_FABRIC_IP=198.19.250.1
+VONK_PEER_FABRIC_IP=198.19.250.2
+VONK_ENDPOINT_HOST_PORTS=8000,8101
+VONK_HOST_ENDPOINT_PORTS=8888
+VONK_RENDEZVOUS_PORT=29500
+"""
 FIXTURE_CREDENTIAL = b"evaluation-native-recovery-fixture-credential\n"
 DENIED = (
     "controller_started",
@@ -483,6 +491,10 @@ def wait_for_package_finisher(paths: Sequence[str]) -> None:
                     "40",
                     "-u",
                     "vonk-forge-package-helper.service",
+                    "-u",
+                    "vonk-forge-package-helper.socket",
+                    "-u",
+                    "vonk-forge-docker-firewall.service",
                 ],
                 sudo=True,
             )
@@ -618,6 +630,19 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     cred_path.write_bytes(FIXTURE_CREDENTIAL)
     authority_path = fixtures / "host-helper-authority.pub"
     authority_path.write_bytes(FIXTURE_AUTHORITY)
+    firewall_path = fixtures / "docker-firewall.conf"
+    firewall_path.write_bytes(FIXTURE_FIREWALL)
+    # Disposable host only: provide the topology required by the unchanged
+    # packaged firewall dependency. No model or Controller is started here.
+    for interface, address in (
+        ("vrec-mgmt", "198.18.250.1/24"),
+        ("vrec-fabric", "198.19.250.1/24"),
+    ):
+        require(["/usr/sbin/ip", "link", "add", interface, "type", "dummy"], sudo=True)
+        require(
+            ["/usr/sbin/ip", "address", "add", address, "dev", interface], sudo=True
+        )
+        require(["/usr/sbin/ip", "link", "set", interface, "up"], sudo=True)
     connection = sqlite3.connect(sqlite_path)
     try:
         connection.execute("CREATE TABLE fixture (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
@@ -630,6 +655,7 @@ def recover(arguments: argparse.Namespace) -> dict[str, object]:
     for source, destination, mode in (
         (toml_path, "/etc/vonk-forge-agent/agent.toml", "0640"),
         (authority_path, "/etc/vonk-forge-agent/host-helper-authority.pub", "0644"),
+        (firewall_path, "/etc/vonk-forge-agent/docker-firewall.conf", "0600"),
         (cred_path, "/var/lib/vonk-forge-agent/credentials/fixture.key", "0600"),
         (sqlite_path, "/var/lib/vonk-forge-agent/state.sqlite", "0600"),
     ):
