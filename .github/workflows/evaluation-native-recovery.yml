@@ -1,0 +1,157 @@
+name: Fork evaluation native recovery
+on:
+  push:
+    branches: [patch/evaluation-fabric-recovery]
+  workflow_dispatch:
+    inputs:
+      current_bundle_tag:
+        description: Fork prerelease tag evaluation/SOURCE for the candidate bundle
+        required: true
+        type: string
+      current_bundle_sha256:
+        description: Exact evaluation-bundle.tar SHA256
+        required: true
+        type: string
+      current_source_sha:
+        description: Candidate SOURCE pin; explicitly selected, never guessed
+        required: true
+        default: 87e334856a6ce8029051f52f7694473089906bab
+        type: string
+      current_version:
+        description: Exact candidate package version
+        required: true
+        default: 0.1.1~dev.554+g87e334856a6c
+        type: string
+      baseline_bundle_tag:
+        description: Fork prerelease tag for evaluation-native-baseline.tar
+        required: true
+        type: string
+      baseline_bundle_sha256:
+        description: Exact evaluation-native-baseline.tar SHA256
+        required: true
+        type: string
+      baseline_source_sha:
+        description: Baseline SOURCE pin
+        required: true
+        default: 21a4427c977869859c9910a39d07308605990e6e
+        type: string
+      baseline_version:
+        description: Exact baseline package version
+        required: true
+        default: 0.1.1~dev.546+g21a4427c9778
+        type: string
+permissions:
+  contents: read
+jobs:
+  recovery:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && github.ref == 'refs/heads/patch/evaluation-fabric-recovery'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      VONK_EVALUATION_DISPOSABLE: "1"
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.1"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Retrieve signed current and baseline public bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_BUNDLE_TAG: ${{ inputs.current_bundle_tag }}
+          CURRENT_BUNDLE_SHA256: ${{ inputs.current_bundle_sha256 }}
+          CURRENT_SOURCE_SHA: ${{ inputs.current_source_sha }}
+          CURRENT_VERSION: ${{ inputs.current_version }}
+          BASELINE_BUNDLE_TAG: ${{ inputs.baseline_bundle_tag }}
+          BASELINE_BUNDLE_SHA256: ${{ inputs.baseline_bundle_sha256 }}
+          BASELINE_SOURCE_SHA: ${{ inputs.baseline_source_sha }}
+          BASELINE_VERSION: ${{ inputs.baseline_version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = kelchm/vonk-forge
+          test "$GITHUB_REF" = refs/heads/patch/evaluation-fabric-recovery
+          [[ "$CURRENT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASELINE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CURRENT_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BASELINE_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$CURRENT_SOURCE_SHA" != "$BASELINE_SOURCE_SHA"
+          test "$CURRENT_BUNDLE_TAG" = "evaluation/$CURRENT_SOURCE_SHA"
+          # Exact version pins bound to their own source; strictly increasing.
+          [[ "$CURRENT_VERSION" =~ ^0\.1\.1~dev\.([0-9]+)\+g([0-9a-f]{12})$ ]]
+          current_serial="${BASH_REMATCH[1]}"
+          test "${BASH_REMATCH[2]}" = "${CURRENT_SOURCE_SHA:0:12}"
+          [[ "$BASELINE_VERSION" =~ ^0\.1\.1~dev\.([0-9]+)\+g([0-9a-f]{12})$ ]]
+          baseline_serial="${BASH_REMATCH[1]}"
+          test "${BASH_REMATCH[2]}" = "${BASELINE_SOURCE_SHA:0:12}"
+          test "$current_serial" -gt "$baseline_serial"
+          mkdir -p "$RUNNER_TEMP/evaluation-input"
+          gh release download "$CURRENT_BUNDLE_TAG" --repo kelchm/vonk-forge \
+            --pattern evaluation-bundle.tar --dir "$RUNNER_TEMP/evaluation-input"
+          gh release download "$BASELINE_BUNDLE_TAG" --repo kelchm/vonk-forge \
+            --pattern evaluation-native-baseline.tar --dir "$RUNNER_TEMP/evaluation-input"
+      - name: Extract bounded signed archives
+        env:
+          CURRENT_BUNDLE_SHA256: ${{ inputs.current_bundle_sha256 }}
+          BASELINE_BUNDLE_SHA256: ${{ inputs.baseline_bundle_sha256 }}
+        run: |
+          set -euo pipefail
+          uv run --frozen python tests/acceptance/evaluation_native_recovery.py extract \
+            --archive "$RUNNER_TEMP/evaluation-input/evaluation-bundle.tar" \
+            --sha256 "$CURRENT_BUNDLE_SHA256" \
+            --destination "$RUNNER_TEMP/evaluation-input/current"
+          uv run --frozen python tests/acceptance/evaluation_native_recovery.py extract \
+            --archive "$RUNNER_TEMP/evaluation-input/evaluation-native-baseline.tar" \
+            --sha256 "$BASELINE_BUNDLE_SHA256" \
+            --destination "$RUNNER_TEMP/evaluation-input/baseline"
+          cmp install/installer-release-public.pem \
+            "$RUNNER_TEMP/evaluation-input/current/installer-release-public.pem"
+      - name: Prove package-filesystem checkpoint upgrade restore
+        env:
+          CURRENT_SOURCE_SHA: ${{ inputs.current_source_sha }}
+          CURRENT_VERSION: ${{ inputs.current_version }}
+          BASELINE_SOURCE_SHA: ${{ inputs.baseline_source_sha }}
+          BASELINE_VERSION: ${{ inputs.baseline_version }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(id -u)" != 0
+          mkdir -p "$RUNNER_TEMP/evaluation-proof"
+          uv run --frozen python tests/acceptance/evaluation_native_recovery.py run \
+            --current-bundle "$RUNNER_TEMP/evaluation-input/current" \
+            --installer-public-key install/installer-release-public.pem \
+            --candidate-source "$CURRENT_SOURCE_SHA" \
+            --candidate-version "$CURRENT_VERSION" \
+            --baseline-root "$RUNNER_TEMP/evaluation-input/baseline" \
+            --baseline-source "$BASELINE_SOURCE_SHA" \
+            --baseline-version "$BASELINE_VERSION" \
+            --harness-head "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/evaluation-proof/report.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          report = json.loads(pathlib.Path(os.environ["RUNNER_TEMP"], "evaluation-proof/report.json").read_text())
+          assert report["ok"] is True
+          assert report["proof_boundary"] == "evaluation-native-package-filesystem-recovery"
+          assert report["native_bootstrap_acceptance"] is False
+          assert report["controller_upgrade_acceptance"] is False
+          assert report["synthetic_canary"] is False
+          assert report["physical_gpu_acceptance"] is False
+          assert report["harness_head"] == os.environ["GITHUB_SHA"]
+          assert report["candidate"]["source_sha"] == os.environ["CURRENT_SOURCE_SHA"]
+          assert report["candidate"]["version"] == os.environ["CURRENT_VERSION"]
+          assert report["baseline"]["source_sha"] == os.environ["BASELINE_SOURCE_SHA"]
+          assert report["baseline"]["version"] == os.environ["BASELINE_VERSION"]
+          assert report["restored"]["package_version"] == os.environ["BASELINE_VERSION"]
+          PY
+      - name: Retain bounded package-filesystem proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evaluation-native-recovery-proof-${{ github.sha }}
+          path: ${{ runner.temp }}/evaluation-proof/report.json
+          retention-days: 7
+          if-no-files-found: ignore
