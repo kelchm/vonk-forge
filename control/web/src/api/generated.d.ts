@@ -3082,7 +3082,7 @@ export interface components {
              * Network Mode
              * @enum {string}
              */
-            network_mode: "none" | "bridge";
+            network_mode: "none" | "bridge" | "host";
             /** No New Privileges */
             no_new_privileges: boolean;
             /** Privileged */

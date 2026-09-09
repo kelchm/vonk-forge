@@ -647,7 +647,7 @@ class CompiledExecutionPlan(_Strict):
                         or address.is_multicast or address.is_link_local
                     ):
                         raise ValueError("host fabric requires routable IPv4 addresses")
-                if (placement.rank == 0) != (local == master):
+                if (placement.endpoint_address is not None) != (local == master):
                     raise ValueError("host fabric master must match the endpoint rank")
         expected_network = (
             "host"

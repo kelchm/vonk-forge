@@ -31,11 +31,19 @@ Native execution derives the fixed host IPC, InfiniBand device, unlimited
 memlock and 64 MiB stack settings; recipes cannot supply arbitrary device or
 privilege flags. Single-node workloads and artifact jobs do not gain host mode.
 
+This mode requires a usable host RDMA device tree and a matching active RoCE
+interface. Connected placement alone does not prove that capability: current
+inventory has no separate RDMA admission field. Verify the selected interface
+and device before qualification; generic Ethernet-only hosts are not qualified
+by this contract. Missing devices fail launch rather than selecting a TCP
+fallback.
+
 Before starting or inspecting either rank, the privileged helper checks that
 the resolved local address, master address and rendezvous port match the
 root-owned Docker firewall configuration and that its rules are installed.
-Rank zero must own the master address and an authorized host endpoint port;
-rank one must use the configured peer as master and expose no API listener.
+The endpoint owner must own the master address and an authorized host endpoint
+port; the other rank must use the configured peer as master and expose no API
+listener. Endpoint ownership follows the recipe and need not be rank zero.
 These checks never apply firewall rules or change host configuration. Installed
 plans may have unresolved addresses; launch and retained inspection require
 resolved placement. A missing or mismatched policy fails the normal lifecycle.

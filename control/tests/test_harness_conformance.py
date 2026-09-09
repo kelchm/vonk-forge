@@ -7,6 +7,7 @@ from vonk_control.compiled_execution_plan import CompiledExecutionPlan
 from vonk_control.harness_conformance import (
     HarnessConformanceError,
     _fixture_request,
+    run_recipe_conformance,
     run_synthetic_conformance,
     validate_terminal_evidence,
 )
@@ -62,6 +63,35 @@ def test_conformance_fixture_uses_canonical_pydantic_definitions() -> None:
     assert isinstance(request.plan, CompiledExecutionPlan)
     assert request.plan.schema_version == 2
     assert request.runtime_spec["identity"]["recipe_revision_sha256"]
+
+
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+@pytest.mark.parametrize("fabric", ["connected", "full_mesh", "switch"])
+@pytest.mark.parametrize("rank,role", [(0, "entrypoint"), (1, "worker")])
+def test_two_node_recipe_conformance_preserves_host_network_without_claiming_offline(engine, fabric, rank, role):
+    request = _fixture_request(engine)
+    raw = request.recipe.model_dump(mode="json")
+    owner = raw["topology"]["roles"][0]
+    worker = copy.deepcopy(owner)
+    worker.update(name="worker", endpoint_owner=False)
+    raw["topology"].update(
+        mode="distributed", node_count=2, roles=[owner, worker],
+        parallelism={"world_size": 2, "tensor": 2, "pipeline": 1, "data": 1, "backend": "mp" if engine == "vllm" else "native"},
+        fabric={"connectivity": fabric, "minimum_bandwidth_mbps": 1},
+        start_order=["worker", "entrypoint"], stop_order=["entrypoint", "worker"],
+    )
+    for selection in raw["models"]:
+        for file in selection["files"]:
+            file["roles"] = ["entrypoint", "worker"]
+    recipe = RecipeDefinition.model_validate(raw)
+    evidence = run_recipe_conformance(recipe, request.models, rank=rank, role=role)
+    assert evidence.security["network_mode"] == "host"
+    assert evidence.offline_runtime is False
+    assert evidence.interrupted_start_recovered and evidence.interrupted_stop_recovered
+    raw["topology"]["roles"].reverse()
+    reversed_evidence = run_recipe_conformance(raw, request.models, rank=1 - rank, role=role)
+    assert reversed_evidence.security["network_mode"] == "host"
+    assert reversed_evidence.offline_runtime is False
 
 
 def test_artifact_job_uses_production_nullable_placement() -> None:

@@ -2385,10 +2385,8 @@ fn validate_docker_run_with_archive(
         {
             return Err(OperationError::InvalidOperation);
         }
-        match rank {
-            Some(0) if local == master && listen_port.is_some() => {}
-            Some(1) if local != master && listen_port.is_none() => {}
-            _ => return Err(OperationError::InvalidOperation),
+        if listen_port.is_some() != (local == master) {
+            return Err(OperationError::InvalidOperation);
         }
         Some((local, master, port))
     } else {
@@ -4122,10 +4120,25 @@ mod tests {
         assert!(validated.job_timeout_seconds.is_none());
         assert!(!rank0.windows(2).any(|window| window[0] == "--publish"));
 
+        let mut nonzero_owner = rank0.clone();
+        let rank = nonzero_owner
+            .iter()
+            .position(|value| value == "VONK_RANK=0")
+            .unwrap();
+        nonzero_owner[rank] = "VONK_RANK=1".to_owned();
+        assert!(validate_docker_run(&nonzero_owner, &roots, None).is_ok());
+
         let rank1 = host_fabric_arguments(&roots, model, 1, "192.168.100.11", "192.168.100.10");
         let validated = validate_docker_run(&rank1, &roots, None).unwrap();
         assert!(validated.detached);
         assert_eq!(validated.host_endpoint_port, None);
+        let mut zero_worker = rank1.clone();
+        let rank = zero_worker
+            .iter()
+            .position(|value| value == "VONK_RANK=1")
+            .unwrap();
+        zero_worker[rank] = "VONK_RANK=0".to_owned();
+        assert!(validate_docker_run(&zero_worker, &roots, None).is_ok());
         assert_eq!(
             validated.fabric_binding,
             Some((

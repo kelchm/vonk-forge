@@ -328,6 +328,7 @@ struct RecordingRunner {
     runtime_container: Arc<Mutex<Option<(String, String)>>>,
     runtime_running: Arc<Mutex<bool>>,
     fail_systemd_run: Arc<Mutex<bool>>,
+    fail_firewall_action: Arc<Mutex<Option<String>>>,
     docker_load_stdout: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
@@ -445,6 +446,20 @@ impl CommandRunner for RecordingRunner {
             .lock()
             .unwrap()
             .push((executable.to_path_buf(), arguments.to_vec()));
+        if executable == std::path::Path::new("/usr/lib/vonk-forge/vonk-forge-docker-firewall")
+            && self
+                .fail_firewall_action
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|action| arguments.get(2) == Some(action))
+        {
+            return Ok(CommandOutput {
+                success: false,
+                stdout: Vec::new(),
+                exit_code: Some(1),
+            });
+        }
         let mut success = true;
         let stdout = if executable == std::path::Path::new("/usr/bin/docker")
             && arguments.first().is_some_and(|value| value == "load")
@@ -1313,6 +1328,24 @@ fn host_fabric_start_checks_firewall_without_applying_rules() {
         None,
     )
     .unwrap();
+    for action in ["check-fabric", "check-host-port"] {
+        *runner.fail_firewall_action.lock().unwrap() = Some(action.to_owned());
+        runner.calls.lock().unwrap().clear();
+        assert!(
+            executor
+                .execute(&runtime_operation(&request, digest.clone()))
+                .is_err()
+        );
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(program, _)| program == std::path::Path::new("/usr/bin/docker"))
+        );
+    }
+    *runner.fail_firewall_action.lock().unwrap() = None;
     executor
         .execute(&runtime_operation(&request, digest))
         .unwrap();

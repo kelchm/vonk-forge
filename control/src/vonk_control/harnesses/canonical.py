@@ -363,7 +363,7 @@ def _harness_security(slug: str, topology: object) -> tuple[tuple[str, ...], boo
         and getattr(topology, "mode", None) == "distributed"
         and getattr(topology, "node_count", None) == 2
         and getattr(getattr(topology, "parallelism", None), "world_size", None) == 2
-        and getattr(getattr(topology, "fabric", None), "connectivity", None) == "connected"
+        and getattr(getattr(topology, "fabric", None), "connectivity", None) in {"connected", "full_mesh", "switch"}
     )
     return devices, host_network
 

@@ -41,8 +41,10 @@ fi
 $helper --config "$config" apply
 $helper --config "$config" check
 $helper --config "$config" check-host-port 8888
+before_check=$(/usr/sbin/iptables-save)
 $helper --config "$config" check-fabric 192.168.100.10 192.168.100.10 29500
 $helper --config "$config" check-fabric 192.168.100.10 192.168.100.11 29500
+test "$before_check" = "$(/usr/sbin/iptables-save)"
 if $helper --config "$config" check-fabric 192.168.100.11 192.168.100.10 29500 >/dev/null 2>&1; then
     echo "peer local fabric address was accepted" >&2
     exit 1
@@ -98,6 +100,10 @@ $iptables -A VONK-FORGE-HOST -i vonk-fabric -s 192.168.100.11 \
     -d 192.168.100.10 -p tcp -j RETURN
 if $helper --config "$config" check >/dev/null 2>&1; then
     echo "host endpoint drop shadowed peer traffic without detection" >&2
+    exit 1
+fi
+if $helper --config "$config" check-fabric 192.168.100.10 192.168.100.11 29500 >/dev/null 2>&1; then
+    echo "fabric check accepted shadowed peer rules" >&2
     exit 1
 fi
 $helper --config "$config" apply

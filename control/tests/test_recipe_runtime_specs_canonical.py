@@ -386,7 +386,7 @@ def test_published_distributed_sglang_preserves_authored_launch_and_rank() -> No
     assert worker_argv[worker_argv.index("--node-rank") + 1] == "1"
     assert entry_argv[-4:] == ["--host", "0.0.0.0", "--port", "30000"]
     assert entrypoint["runtime"]["entrypoint"] != worker["runtime"]["entrypoint"]
-    assert entrypoint["security"]["network_mode"] == "none"
+    assert entrypoint["security"]["network_mode"] == "host"
     assert entrypoint["security"]["devices"] == ["nvidia.com/gpu=all"]
     assert {
         mount["target"] for mount in entrypoint["security"]["mounts"]

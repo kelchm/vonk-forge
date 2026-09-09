@@ -1727,7 +1727,7 @@ def test_host_mode_rejects_incomplete_or_unrelated_workloads(mutation):
     elif mutation == "partial_address":
         payload["runtime"]["placement"]["local_address"] = "198.19.240.11"
     elif mutation == "wrong_master":
-        payload["runtime"]["placement"].update(local_address="198.19.240.11", master_address="198.19.240.12")
+        payload["runtime"]["placement"].update(endpoint_address="192.0.2.10", local_address="198.19.240.11", master_address="198.19.240.12")
     elif mutation == "ipv6":
         payload["runtime"]["placement"].update(local_address="2001:db8::1", master_address="2001:db8::1")
     else:

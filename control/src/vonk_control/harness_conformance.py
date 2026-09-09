@@ -166,7 +166,8 @@ class _PlanLifecycleExecutor:
     def invoke(self) -> Mapping[str, object]:
         self._require("running")
         security = _mapping(self._request.runtime_spec.get("security"), "security")
-        return {"offline": security.get("network_mode") == "none", "state": self._state}
+        mode = security.get("network_mode")
+        return {"offline": mode == "none", "network_mode": mode, "state": self._state}
 
     def stop(self, deadline: float) -> Mapping[str, object]:
         self._require("running")
@@ -285,8 +286,9 @@ def _run_plan_conformance(request: LifecycleRequest, *, clock: DeterministicCloc
     if ready.get("ready") is not True:
         raise HarnessConformanceError("ready evidence is invalid")
     invocation = _observe(observations, "invoke", executor.invoke())
-    if invocation.get("offline") is not True:
-        raise HarnessConformanceError("offline invocation evidence is invalid")
+    mode = _mapping(request.runtime_spec.get("security"), "security").get("network_mode")
+    if invocation.get("network_mode") != mode or invocation.get("offline") is not (mode == "none"):
+        raise HarnessConformanceError("invocation network evidence is invalid")
     _observe_state(observations, "inspect", executor.inspect(), "running")
     deadline = clock() + _runtime_timeout(request.runtime_spec)
     stopped = _recover_stop(executor, observations, deadline)
@@ -342,12 +344,16 @@ def _compile_request(
         # Conformance supplies only deterministic addresses for distributed
         # lifecycle evidence; it never invents job endpoints or resources.
         if recipe.topology.parallelism.world_size > 1:
+            owner_index = next(i for i, item in enumerate(recipe.topology.roles) if item.endpoint_owner)
+            owner_rank = sum(item.count for item in recipe.topology.roles[:owner_index])
+            master_address = f"192.0.2.{owner_rank + 2}"
             placement.update(
                 local_address=f"192.0.2.{rank + 2}",
-                master_address="192.0.2.1",
+                master_address=master_address,
             )
-            if runtime_spec.get("endpoint") is not None:
-                placement["endpoint_address"] = "192.0.2.1"
+            owner = next(item for item in recipe.topology.roles if item.name == role)
+            if owner.endpoint_owner and runtime_spec.get("endpoint") is not None:
+                placement["endpoint_address"] = master_address
         launch_payload = plan.to_compiled_launch_payload(
             runtime_spec,
             placement=placement,
@@ -520,7 +526,7 @@ def _validated_security(prepared: Mapping[str, object], runtime_spec: Mapping[st
     expected = _runtime_security(runtime_spec, plan)
     if not isinstance(security, Mapping) or dict(security) != expected:
         raise HarnessConformanceError("lifecycle security evidence is invalid")
-    if expected["architecture"] != "linux/arm64" or expected["network_mode"] != "none":
+    if expected["architecture"] != "linux/arm64" or expected["network_mode"] not in {"none", "host"}:
         raise HarnessConformanceError("canonical runtime security is invalid")
     if expected["docker_socket"] is not False or expected["no_new_privileges"] is not True:
         raise HarnessConformanceError("canonical runtime security is invalid")

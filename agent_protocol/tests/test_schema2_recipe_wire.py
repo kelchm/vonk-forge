@@ -354,12 +354,13 @@ def test_python_compiled_plan_producer_crosses_rust_parser(
 
 
 @pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("owner_rank", [0, 1])
 @pytest.mark.parametrize("resolved", [False, True])
 def test_host_fabric_plan_round_trips_installed_and_resolved_ranks(
-    compiled_plan_wire_probe: Path, rank: int, resolved: bool,
+    compiled_plan_wire_probe: Path, rank: int, owner_rank: int, resolved: bool,
 ) -> None:
     value = copy.deepcopy(PLAN)
-    role = "entrypoint" if rank == 0 else "worker"
+    role = "entrypoint" if rank == owner_rank else "worker"
     value["security"].update(network_mode="host", host_network=True)
     value["topology"].update(
         backend="mp", mode="distributed", name="dual", node_count=2,
@@ -368,8 +369,8 @@ def test_host_fabric_plan_round_trips_installed_and_resolved_ranks(
     value["runtime"]["placement"].update(
         rank=rank, role=role, world_size=2, master_port=29500,
         local_address=f"198.19.240.{11 + rank}" if resolved else None,
-        master_address="198.19.240.11" if resolved else None,
-        endpoint_address="192.0.2.10" if resolved and rank == 0 else None,
+        master_address=f"198.19.240.{11 + owner_rank}" if resolved else None,
+        endpoint_address="192.0.2.10" if resolved and rank == owner_rank else None,
     )
     authored = CompiledExecutionPlan.parse(value).to_mapping()
     returned = _rust_compiled_plan_round_trip(compiled_plan_wire_probe, authored)
@@ -377,7 +378,7 @@ def test_host_fabric_plan_round_trips_installed_and_resolved_ranks(
     assert canonical_message(CompiledExecutionPlan.parse(returned)) == canonical_message(authored)
     assert returned["security"]["host_network"] is True
     assert returned["runtime"]["placement"]["master_address"] == (
-        "198.19.240.11" if resolved else None
+        f"198.19.240.{11 + owner_rank}" if resolved else None
     )
 
     for mutation in (
@@ -386,7 +387,8 @@ def test_host_fabric_plan_round_trips_installed_and_resolved_ranks(
             local_address="198.19.240.11", master_address=None,
         ),
         lambda item: item["runtime"]["placement"].update(
-            local_address="198.19.240.12" if rank == 0 else "198.19.240.11",
+            endpoint_address="192.0.2.10",
+            local_address="198.19.240.12",
             master_address="198.19.240.11",
         ),
         lambda item: item["runtime"]["placement"].update(

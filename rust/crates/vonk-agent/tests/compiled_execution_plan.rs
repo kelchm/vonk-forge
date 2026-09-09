@@ -433,6 +433,17 @@ fn host_mode_start_requires_routable_rank_roles() {
     worker.validate().unwrap();
     worker.runtime.placement.validate_host_bound().unwrap();
 
+    let mut nonzero_owner = host_fabric_plan();
+    nonzero_owner["runtime"]["placement"]["rank"] = json!(1);
+    nonzero_owner["topology"]["rank"] = json!(1);
+    let nonzero_owner: CompiledExecutionPlan = serde_json::from_value(nonzero_owner).unwrap();
+    nonzero_owner.validate().unwrap();
+    nonzero_owner
+        .runtime
+        .placement
+        .validate_host_bound()
+        .unwrap();
+
     let mut inverted = host_fabric_plan();
     inverted["runtime"]["placement"]["master_address"] = json!("192.168.100.11");
     let inverted: CompiledExecutionPlan = serde_json::from_value(inverted).unwrap();
