@@ -523,3 +523,12 @@ def test_root_context_cannot_copy_reincluded_credential_artifacts(
             artifact.rmdir()
 
     assert result.returncode != 0
+
+
+def test_controller_build_verifies_the_committed_protocol_wheel() -> None:
+    import hashlib
+
+    wheel = ROOT / "inventory/wheels/vonk_agent_protocol-2.2.0-py3-none-any.whl"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    dockerfile = (ROOT / "control/Dockerfile").read_text()
+    assert f'| cut -d\' \' -f1)" = "{digest}"' in dockerfile
