@@ -253,6 +253,7 @@ def test_fresh_install_has_an_ordered_forward_migration_chain() -> None:
         "0022_current_telemetry_defaults.py",
         "0023_recipe_route_authority.py",
         "0024_failure_evidence.py",
+        "0025_retired_cache_fields.py",
     ]
 
 
@@ -700,7 +701,7 @@ def test_existing_compatibility_recovery_revision_upgrades_without_operational_m
     with engine.connect() as connection:
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-                    == "0024_failure_evidence"
+                    == "0025_retired_cache_fields"
         )
         assert "agent_upgrade_compatibility_recoveries" in set(
             inspect(connection).get_table_names()
@@ -831,7 +832,7 @@ def test_existing_baseline_is_upgraded_to_accept_node_profile_events(
             connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-                    == "0024_failure_evidence"
+                    == "0025_retired_cache_fields"
         )
 
 
@@ -913,7 +914,7 @@ def test_existing_database_missing_fleet_profile_tables_is_repaired(
             connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-                    == "0024_failure_evidence"
+                    == "0025_retired_cache_fields"
         )
 
 
