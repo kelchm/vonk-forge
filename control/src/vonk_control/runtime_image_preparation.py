@@ -376,6 +376,7 @@ def persist_runtime_image_receipt(
         RuntimeImageReceiptRow.original_content_digest == original_content_digest,
         RuntimeImageReceiptRow.effective_execution_key == effective_execution_key,
     )
+    row = session.scalar(lookup)
     conflicting_artifact = session.scalar(
         select(RuntimeImageReceiptRow).where(
             RuntimeImageReceiptRow.recipe_revision_id == original_revision_id,
@@ -388,14 +389,20 @@ def persist_runtime_image_receipt(
         )
     )
     if (
-        conflicting_artifact is not None
+        row is None
+        and current_revision.id != original_revision_id
+        and conflicting_artifact is not None
         and conflicting_artifact.effective_execution_key != effective_execution_key
     ):
         raise RuntimeImagePreparationError(
             "runtime_image.authorization_invalid",
             "current recipe execution identity does not match the immutable receipt",
         )
-    row = session.scalar(lookup)
+    # Original active revisions may authorize separately compiled ranks and
+    # parameterized executions over the same verified bytes. Editorial
+    # successors can reuse exact bindings, but cannot extend an existing
+    # artifact's binding set. Successor-first distributed preparation remains
+    # unsupported until that reuse context can be validated independently.
     identity = {
         "registry_manifest_digest": receipt.registry_manifest_digest,
         "platform_manifest_digest": receipt.platform_manifest_digest,

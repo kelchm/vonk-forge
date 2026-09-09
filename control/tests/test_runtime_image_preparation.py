@@ -781,9 +781,27 @@ def test_notes_revision_reuses_original_receipt_with_separate_authorization(
             receipt=receipt,
             verified_at=now,
         )
+        # The original recipe may have another compiled rank over these same
+        # bytes; an editorial successor reuses each pre-existing binding.
+        for revision_id in (old_id, new_id):
+            persist_runtime_image_receipt(
+                session,
+                recipe_revision_id=revision_id,
+                original_content_digest=old_digest,
+                effective_execution_key="c" * 64,
+                receipt=receipt,
+                verified_at=now,
+            )
+        assert resolve_persisted_runtime_image_receipt(
+            session,
+            recipe_revision_id=new_id,
+            current_content_digest=new_digest,
+            effective_execution_key="c" * 64,
+            receipt=receipt,
+        ).effective_execution_key == "c" * 64
         session.commit()
-        assert session.query(RuntimeImageReceiptRow).count() == 1
-        assert session.query(RuntimeImageAuthorization).count() == 2
+        assert session.query(RuntimeImageReceiptRow).count() == 2
+        assert session.query(RuntimeImageAuthorization).count() == 4
         assert (
             resolve_persisted_runtime_image_receipt(
                 session,
@@ -804,7 +822,8 @@ def test_notes_revision_reuses_original_receipt_with_separate_authorization(
             )
         authorization = session.scalar(
             select(RuntimeImageAuthorization).where(
-                RuntimeImageAuthorization.recipe_revision_id == new_id
+                RuntimeImageAuthorization.recipe_revision_id == new_id,
+                RuntimeImageAuthorization.effective_execution_key == "a" * 64,
             )
         )
         assert authorization is not None

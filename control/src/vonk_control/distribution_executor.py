@@ -1151,6 +1151,26 @@ class CompositeDistributionPhaseExecutor(DurableDistributionPhaseExecutor):
     def _prepare_runtime_image(
         self, plan: RunSwitchPlan
     ) -> Mapping[str, object] | None:
+        if self._runtime_image_preparer is None:
+            return None
+        if plan.recipe_revision_id is None or not plan.spark_group.nodes:
+            raise RuntimeError("runtime image preparation identity is unavailable")
+        first = None
+        for node in sorted(plan.spark_group.nodes, key=lambda item: (item.rank, item.node_id)):
+            prepared = self._prepare_rank_runtime_image(plan, node)
+            if first is None:
+                first = prepared
+            elif any(prepared[key] != first[key] for key in (
+                "image_digest", "oci_layout_sha256", "image_bytes", "build_id"
+            )):
+                raise RuntimeError("distributed runtime image receipts disagree")
+        # Distribution moves one shared image, but compilation and native spec
+        # reads require each rank's independently compiled execution binding.
+        return first
+
+    def _prepare_rank_runtime_image(
+        self, plan: RunSwitchPlan, node: Any
+    ) -> Mapping[str, object]:
         """Prepare one Controller image before target distribution.
 
         This callback is deliberately supplied only to the durable worker
@@ -1158,14 +1178,10 @@ class CompositeDistributionPhaseExecutor(DurableDistributionPhaseExecutor):
         read-only receipt resolver in ``ControllerExecutionPlanService``.
         """
 
-        if self._runtime_image_preparer is None:
-            return None
-        if plan.recipe_revision_id is None or not plan.spark_group.nodes:
-            raise RuntimeError("runtime image preparation identity is unavailable")
+        assert self._runtime_image_preparer is not None
         from .execution_plan_service import _bind_runtime_artifacts
         from .recipe_runtime_specs import compile_runtime_spec, resolve_recipe_entities
 
-        node = min(plan.spark_group.nodes, key=lambda item: (item.rank, item.node_id))
         with self._sessions() as session:
             revision = session.scalar(
                 select(CatalogDocumentRevision).where(
