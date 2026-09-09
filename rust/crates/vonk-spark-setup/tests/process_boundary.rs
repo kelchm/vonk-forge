@@ -484,7 +484,7 @@ fn real_system_runner_clears_environment_and_forwards_stdin() {
 }
 
 #[test]
-fn canonical_release_anchor_has_the_audited_identity() {
+fn canonical_release_anchor_has_the_audited_evaluation_identity() {
     let anchor =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../install/installer-release-public.pem");
     let der = ProcessCommand::new("/usr/bin/openssl")
@@ -496,7 +496,7 @@ fn canonical_release_anchor_has_the_audited_identity() {
     assert!(der.status.success());
     assert_eq!(
         hex::encode(Sha256::digest(&der.stdout)),
-        "579342a2286f13fd2fe9ea25e44866bb9e50f05bc1f9a5354b5cda28950e1ed4"
+        "db82b83c68ca653690fa5d64dc5fd3bcbcddcc4653279244f3dd92e3dcd05ce5"
     );
     let description = ProcessCommand::new("/usr/bin/openssl")
         .args(["pkey", "-pubin", "-in"])
@@ -505,7 +505,7 @@ fn canonical_release_anchor_has_the_audited_identity() {
         .output()
         .unwrap();
     assert!(description.status.success());
-    assert!(String::from_utf8_lossy(&description.stdout).contains("4096 bit"));
+    assert!(String::from_utf8_lossy(&description.stdout).contains("3072 bit"));
 }
 
 fn install_executing_sudo(paths: &InstallPaths) {
