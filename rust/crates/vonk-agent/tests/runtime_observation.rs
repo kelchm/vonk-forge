@@ -18,6 +18,28 @@ impl ProcessRunner for NoProcess {
     }
 }
 
+fn schema2_host_plan() -> CompiledExecutionPlan {
+    let mut value: Value = serde_json::from_str(include_str!(
+        "../../../../control/tests/fixtures/compiled_workload_v2.json"
+    ))
+    .unwrap();
+    value["runtime"]["placement"] = json!({
+        "endpoint_address": "192.168.1.211", "rank": 0, "role": "entrypoint", "world_size": 2,
+        "local_address": "192.168.100.10", "master_address": "192.168.100.10",
+        "master_port": 29500, "port": 8000, "reserved_memory_bytes": 68719476736_u64
+    });
+    value["security"]["network_mode"] = json!("host");
+    value["security"]["host_network"] = json!(true);
+    value["security"]["devices"] = json!(["nvidia.com/gpu=all"]);
+    value["topology"] = json!({
+        "name": "dual", "mode": "distributed", "backend": "nccl",
+        "node_count": 2, "world_size": 2, "rank": 0, "role": "entrypoint"
+    });
+    let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+    plan.validate().unwrap();
+    plan
+}
+
 fn schema2_dual_plan() -> CompiledExecutionPlan {
     let mut value: Value = serde_json::from_str(include_str!(
         "../../../../control/tests/fixtures/compiled_workload_v2.json"
@@ -357,4 +379,68 @@ fn unbound_compiled_placement_requires_addresses_only_at_execution() {
     assert!(plan.runtime.placement.validate_bound().is_err());
     let bound = schema2_dual_plan();
     bound.runtime.placement.validate_bound().unwrap();
+}
+
+#[test]
+fn host_mode_retained_inspection_matches_complete_launch_shape() {
+    let root = tempdir().unwrap();
+    let mut installed = schema2_host_plan();
+    installed.runtime.placement.local_address = None;
+    installed.runtime.placement.master_address = None;
+    installed.runtime.placement.endpoint_address = None;
+    installed.validate().unwrap();
+    persist_plan(root.path(), &installed);
+
+    let started = schema2_host_plan();
+    started.validate().unwrap();
+    started.runtime.placement.validate_host_bound().unwrap();
+    let runtime = OciRuntime {
+        runner: &NoProcess,
+        data_root: root.path(),
+        huggingface_curl_config: None,
+    };
+    let launched = runtime
+        .prepare_start_with_inspection_identity(
+            &started,
+            INSTALLATION,
+            RUN,
+            &placement(&started),
+            &identity(&started),
+        )
+        .unwrap();
+    let inspections = runtime.recipe_run_inspection_plans().unwrap();
+    assert_eq!(inspections.len(), 1);
+    assert_eq!(&inspections[0].arguments[4..], launched.main.as_slice());
+    assert!(
+        launched
+            .main
+            .windows(2)
+            .any(|window| window == ["--network", "host"])
+    );
+    assert!(
+        launched
+            .main
+            .windows(2)
+            .any(|window| window == ["--ipc", "host"])
+    );
+    assert!(
+        launched
+            .main
+            .windows(2)
+            .any(|window| window == ["--device", "/dev/infiniband:/dev/infiniband"])
+    );
+    assert!(
+        launched
+            .main
+            .windows(2)
+            .any(|window| window == ["--ulimit", "memlock=-1:-1"])
+    );
+    assert!(
+        launched
+            .main
+            .windows(2)
+            .any(|window| window == ["--ulimit", "stack=67108864:67108864"])
+    );
+    assert!(!launched.main.iter().any(|value| value == "--publish"));
+    assert_eq!(runtime.load_spec(INSTALLATION).unwrap(), installed);
 }

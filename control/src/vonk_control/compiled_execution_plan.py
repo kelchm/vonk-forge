@@ -569,12 +569,17 @@ class CompiledExecutionPlan(_StrictModel):
             raise CompiledExecutionPlanError("runtime role is invalid")
 
         declared_network_mode = security.get("network_mode")
-        if declared_network_mode not in {"none", "bridge"} or security.get("host_network") is not False:
+        if (
+            declared_network_mode not in {"none", "bridge", "host"}
+            or security.get("host_network") is not (declared_network_mode == "host")
+        ):
             raise CompiledExecutionPlanError(
                 "compiled security has an unsupported network mode or host networking"
             )
         network_mode = (
-            "bridge"
+            "host"
+            if declared_network_mode == "host"
+            else "bridge"
             if placement_doc["endpoint_address"] is not None
             or placement_doc["master_port"] is not None
             else "none"

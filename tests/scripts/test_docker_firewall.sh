@@ -41,6 +41,28 @@ fi
 $helper --config "$config" apply
 $helper --config "$config" check
 $helper --config "$config" check-host-port 8888
+$helper --config "$config" check-fabric 192.168.100.10 192.168.100.10 29500
+$helper --config "$config" check-fabric 192.168.100.10 192.168.100.11 29500
+if $helper --config "$config" check-fabric 192.168.100.11 192.168.100.10 29500 >/dev/null 2>&1; then
+    echo "peer local fabric address was accepted" >&2
+    exit 1
+fi
+if $helper --config "$config" check-fabric 192.168.100.10 10.0.0.5 29500 >/dev/null 2>&1; then
+    echo "arbitrary master fabric address was accepted" >&2
+    exit 1
+fi
+if $helper --config "$config" check-fabric 192.168.100.10 192.168.1.211 29500 >/dev/null 2>&1; then
+    echo "management master address was accepted as fabric" >&2
+    exit 1
+fi
+if $helper --config "$config" check-fabric 192.168.100.10 192.168.100.10 8000 >/dev/null 2>&1; then
+    echo "wrong rendezvous port was accepted" >&2
+    exit 1
+fi
+if $helper --config "$config" check-fabric 192.168.100.10 192.168.100.10 8888 >/dev/null 2>&1; then
+    echo "host endpoint port was accepted as rendezvous" >&2
+    exit 1
+fi
 $helper --config "$config" apply
 $helper --config "$config" check
 test "$($iptables -S DOCKER-USER | sed -n '/^-A DOCKER-USER /{p;q;}')" = \

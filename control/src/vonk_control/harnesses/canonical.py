@@ -361,6 +361,9 @@ def _harness_security(slug: str, topology: object) -> tuple[tuple[str, ...], boo
     host_network = (
         "host-network" in metadata.security_exceptions
         and getattr(topology, "mode", None) == "distributed"
+        and getattr(topology, "node_count", None) == 2
+        and getattr(getattr(topology, "parallelism", None), "world_size", None) == 2
+        and getattr(getattr(topology, "fabric", None), "connectivity", None) == "connected"
     )
     return devices, host_network
 
@@ -414,7 +417,7 @@ def compile_canonical_harness(
         if "--output-dir" not in command:
             command.extend(("--output-dir", "/outputs"))
     _validate_argv_size(command)
-    devices, _host_network = _harness_security(slug, topology)
+    devices, host_network = _harness_security(slug, topology)
     model_mounts: list[HarnessMount] = []
     for _artifact, mount in mounts:
         if mount not in model_mounts:
@@ -425,7 +428,7 @@ def compile_canonical_harness(
         contract_version=1,
         command=tuple(command),
         image=image,
-        network_mode="none",
+        network_mode="host" if host_network else "none",
         architecture="linux/arm64",
         user="10001:10001",
         no_new_privileges=True,

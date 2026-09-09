@@ -1282,12 +1282,15 @@ pub enum CompiledSecurityNetworkMode {
     None,
     #[serde(rename = "bridge")]
     Bridge,
+    #[serde(rename = "host")]
+    Host,
 }
 impl ::std::fmt::Display for CompiledSecurityNetworkMode {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         match *self {
             Self::None => f.write_str("none"),
             Self::Bridge => f.write_str("bridge"),
+            Self::Host => f.write_str("host"),
         }
     }
 }
@@ -1297,6 +1300,7 @@ impl ::std::str::FromStr for CompiledSecurityNetworkMode {
         match value {
             "none" => Ok(Self::None),
             "bridge" => Ok(Self::Bridge),
+            "host" => Ok(Self::Host),
             _ => Err("invalid value".into()),
         }
     }
@@ -7329,6 +7333,7 @@ impl CompiledSecurityNetworkMode {
         match self {
             Self::None => "none",
             Self::Bridge => "bridge",
+            Self::Host => "host",
         }
     }
 }

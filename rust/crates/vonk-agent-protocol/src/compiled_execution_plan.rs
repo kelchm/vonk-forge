@@ -176,7 +176,37 @@ impl CompiledExecutionPlan {
             (None, Some(job)) => job.validate()?,
             _ => unreachable!("validated endpoint/job discriminator"),
         }
+        if self.security.network_mode.as_str() == "host" {
+            self.validate_host_fabric()?;
+        }
         Ok(())
+    }
+
+    fn validate_host_fabric(&self) -> Result<(), WorkloadError> {
+        if self.topology.mode.as_str() != "distributed"
+            || self.topology.node_count != 2
+            || self.topology.world_size != 2
+            || self.runtime.placement.world_size != 2
+            || self.endpoint.is_none()
+            || self.job.is_some()
+            || self
+                .runtime
+                .placement
+                .master_port
+                .is_none_or(|port| port < 1024)
+        {
+            return Err(WorkloadError::Invalid("compiled execution identity"));
+        }
+        match (
+            self.runtime.placement.local_address,
+            self.runtime.placement.master_address,
+        ) {
+            (None, None) => Ok(()),
+            (Some(local), Some(master)) => {
+                host_fabric_roles(self.runtime.placement.rank, local, master)
+            }
+            _ => Err(WorkloadError::Invalid("placement")),
+        }
     }
 }
 
@@ -280,10 +310,18 @@ impl CompiledRuntime {
 
 impl CompiledSecurity {
     fn validate(&self, placement: &CompiledRuntimePlacement) -> Result<(), WorkloadError> {
+        let host_mode = self.network_mode.as_str() == "host";
         let bridge_required =
             placement.endpoint_address.is_some() || placement.master_port.is_some();
-        let expected_network_mode = if bridge_required { "bridge" } else { "none" };
-        if self.privileged
+        let expected_network_mode = if host_mode {
+            "host"
+        } else if bridge_required {
+            "bridge"
+        } else {
+            "none"
+        };
+        if self.host_network != host_mode
+            || self.privileged
             || !self.no_new_privileges
             || !self.read_only_root
             || self.network_mode.as_str() != expected_network_mode
@@ -293,6 +331,7 @@ impl CompiledSecurity {
                 .devices
                 .iter()
                 .any(|value| value != "nvidia.com/gpu=all")
+            || (host_mode && self.devices.as_slice() != ["nvidia.com/gpu=all"])
             || !numeric_non_root_user(&self.user)
             || self.mounts.len() > MAX_COMPILED_EXECUTION_PLAN_MOUNTS
             || self.mounts.iter().any(|mount| !valid_mount_policy(mount))
@@ -577,6 +616,49 @@ impl CompiledRuntimePlacement {
             return Err(WorkloadError::Invalid("placement"));
         }
         Ok(())
+    }
+
+    /// Host-mode start requires resolved, routable two-node fabric roles.
+    pub fn validate_host_bound(&self) -> Result<(), WorkloadError> {
+        self.validate_bound()?;
+        if self.world_size != 2
+            || self.master_port.is_none_or(|port| port < 1024)
+            || (self.rank == 0) != self.endpoint_address.is_some()
+            || self.rank == 0 && self.port.is_none_or(|port| port < 1024)
+        {
+            return Err(WorkloadError::Invalid("placement"));
+        }
+        let (Some(local), Some(master)) = (self.local_address, self.master_address) else {
+            return Err(WorkloadError::Invalid("placement"));
+        };
+        host_fabric_roles(self.rank, local, master)
+    }
+}
+
+fn host_fabric_roles(
+    rank: u64,
+    local: std::net::IpAddr,
+    master: std::net::IpAddr,
+) -> Result<(), WorkloadError> {
+    if !routable_fabric_address(local) || !routable_fabric_address(master) {
+        return Err(WorkloadError::Invalid("placement"));
+    }
+    match rank {
+        0 if local == master => Ok(()),
+        1 if local != master => Ok(()),
+        _ => Err(WorkloadError::Invalid("placement")),
+    }
+}
+
+fn routable_fabric_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_link_local()
+        }
+        std::net::IpAddr::V6(_) => false,
     }
 }
 

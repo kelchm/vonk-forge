@@ -363,3 +363,130 @@ fn mount_projection_rejects_over_duplicate_or_unsafe_targets() {
         Err(WorkloadError::Invalid("compiled security"))
     ));
 }
+
+fn host_fabric_plan() -> Value {
+    let mut value = fixture();
+    value["runtime"]["placement"] = json!({
+        "endpoint_address": "192.168.1.211",
+        "rank": 0,
+        "role": "entrypoint",
+        "world_size": 2,
+        "local_address": "192.168.100.10",
+        "master_address": "192.168.100.10",
+        "master_port": 29500,
+        "port": 8000,
+        "reserved_memory_bytes": 80000000
+    });
+    value["security"]["network_mode"] = json!("host");
+    value["security"]["host_network"] = json!(true);
+    value["security"]["devices"] = json!(["nvidia.com/gpu=all"]);
+    value["topology"] = json!({
+        "name": "dual",
+        "mode": "distributed",
+        "backend": "nccl",
+        "node_count": 2,
+        "world_size": 2,
+        "rank": 0,
+        "role": "entrypoint"
+    });
+    value
+}
+
+#[test]
+fn host_network_flag_must_equal_host_network_mode() {
+    let mut value = fixture();
+    value["security"]["host_network"] = json!(true);
+    let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        plan.validate(),
+        Err(WorkloadError::Invalid("compiled security"))
+    ));
+}
+
+#[test]
+fn host_mode_accepts_unresolved_two_node_endpoint_plan() {
+    let mut value = host_fabric_plan();
+    value["runtime"]["placement"]["local_address"] = Value::Null;
+    value["runtime"]["placement"]["master_address"] = Value::Null;
+    value["runtime"]["placement"]["endpoint_address"] = Value::Null;
+    let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+    plan.validate().unwrap();
+    assert!(plan.runtime.placement.validate_bound().is_err());
+    assert!(plan.runtime.placement.validate_host_bound().is_err());
+}
+
+#[test]
+fn host_mode_start_requires_routable_rank_roles() {
+    let plan: CompiledExecutionPlan = serde_json::from_value(host_fabric_plan()).unwrap();
+    plan.validate().unwrap();
+    plan.runtime.placement.validate_host_bound().unwrap();
+
+    let mut worker = host_fabric_plan();
+    worker["runtime"]["placement"]["rank"] = json!(1);
+    worker["runtime"]["placement"]["role"] = json!("worker");
+    worker["runtime"]["placement"]["endpoint_address"] = Value::Null;
+    worker["runtime"]["placement"]["local_address"] = json!("192.168.100.11");
+    worker["runtime"]["placement"]["master_address"] = json!("192.168.100.10");
+    worker["topology"]["rank"] = json!(1);
+    worker["topology"]["role"] = json!("worker");
+    let worker: CompiledExecutionPlan = serde_json::from_value(worker).unwrap();
+    worker.validate().unwrap();
+    worker.runtime.placement.validate_host_bound().unwrap();
+
+    let mut inverted = host_fabric_plan();
+    inverted["runtime"]["placement"]["master_address"] = json!("192.168.100.11");
+    let inverted: CompiledExecutionPlan = serde_json::from_value(inverted).unwrap();
+    assert!(inverted.validate().is_err());
+
+    let mut loopback = host_fabric_plan();
+    loopback["runtime"]["placement"]["local_address"] = json!("127.0.0.1");
+    loopback["runtime"]["placement"]["master_address"] = json!("127.0.0.1");
+    let loopback: CompiledExecutionPlan = serde_json::from_value(loopback).unwrap();
+    assert!(loopback.validate().is_err());
+}
+
+#[test]
+fn host_mode_rejects_single_node_job_and_partial_identity() {
+    let mut single = host_fabric_plan();
+    single["topology"]["mode"] = json!("single");
+    single["topology"]["node_count"] = json!(1);
+    single["topology"]["world_size"] = json!(1);
+    single["runtime"]["placement"]["world_size"] = json!(1);
+    single["runtime"]["placement"]["rank"] = json!(0);
+    let single: CompiledExecutionPlan = serde_json::from_value(single).unwrap();
+    assert!(single.validate().is_err());
+
+    let mut job = host_fabric_plan();
+    job["endpoint"] = Value::Null;
+    job["runtime"]["placement"]["port"] = Value::Null;
+    job["job"] = json!({
+        "interface": "image-job",
+        "input": {
+            "path": "/inputs",
+            "required": true,
+            "media_types": ["application/octet-stream"],
+            "max_bytes": 1024,
+            "slots": null
+        },
+        "output_path": "/outputs",
+        "timeout_seconds": 90
+    });
+    let job: CompiledExecutionPlan = serde_json::from_value(job).unwrap();
+    assert!(job.validate().is_err());
+
+    let mut extra_device = host_fabric_plan();
+    extra_device["security"]["devices"] =
+        json!(["nvidia.com/gpu=all", "/dev/infiniband:/dev/infiniband"]);
+    let extra_device: CompiledExecutionPlan = serde_json::from_value(extra_device).unwrap();
+    assert!(extra_device.validate().is_err());
+
+    let mut missing_gpu = host_fabric_plan();
+    missing_gpu["security"]["devices"] = json!([]);
+    let missing_gpu: CompiledExecutionPlan = serde_json::from_value(missing_gpu).unwrap();
+    assert!(missing_gpu.validate().is_err());
+
+    let mut no_master_port = host_fabric_plan();
+    no_master_port["runtime"]["placement"]["master_port"] = Value::Null;
+    let no_master_port: CompiledExecutionPlan = serde_json::from_value(no_master_port).unwrap();
+    assert!(no_master_port.validate().is_err());
+}

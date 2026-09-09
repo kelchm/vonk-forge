@@ -352,7 +352,7 @@ class CompiledSecurityMount(_Strict):
 class CompiledSecurity(_Strict):
     devices: list[str]
     capabilities: list[str]
-    network_mode: Literal["none", "bridge"]
+    network_mode: Literal["none", "bridge", "host"]
     host_network: StrictBool
     privileged: StrictBool
     user: str
@@ -363,7 +363,7 @@ class CompiledSecurity(_Strict):
     @model_validator(mode="after")
     def security_is_bounded(self) -> CompiledSecurity:
         if (
-            self.host_network
+            self.host_network != (self.network_mode == "host")
             or self.privileged
             or not self.read_only_root
             or not self.no_new_privileges
@@ -625,8 +625,34 @@ class CompiledExecutionPlan(_Strict):
                 raise ValueError("compiled artifact digest sizes conflict")
         if sum(by_digest.values()) != self.identity.model_artifact_bytes:
             raise ValueError("compiled artifact bytes do not match identity")
+        if self.security.host_network and (
+            self.topology.mode != "distributed"
+            or self.topology.node_count != 2
+            or self.topology.world_size != 2
+            or placement.master_port is None
+            or self.endpoint is None
+            or self.job is not None
+            or self.security.devices != ["nvidia.com/gpu=all"]
+        ):
+            raise ValueError("host networking requires a two-node GPU serving placement")
+        if self.security.host_network:
+            local, master = placement.local_address, placement.master_address
+            if (local is None) != (master is None):
+                raise ValueError("host fabric addresses must be resolved together")
+            if local is not None and master is not None:
+                for raw_address in (local, master):
+                    address = ipaddress.ip_address(raw_address)
+                    if not isinstance(address, ipaddress.IPv4Address) or (
+                        address.is_unspecified or address.is_loopback
+                        or address.is_multicast or address.is_link_local
+                    ):
+                        raise ValueError("host fabric requires routable IPv4 addresses")
+                if (placement.rank == 0) != (local == master):
+                    raise ValueError("host fabric master must match the endpoint rank")
         expected_network = (
-            "bridge"
+            "host"
+            if self.security.host_network
+            else "bridge"
             if placement.endpoint_address is not None
             or placement.master_port is not None
             else "none"

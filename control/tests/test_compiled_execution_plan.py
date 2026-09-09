@@ -1670,3 +1670,67 @@ def test_execution_identity_covers_compiled_launch_facts_and_ignores_notes() -> 
 
     assert all(value != baseline for value in changes)
     assert len(set(changes)) == len(changes)
+
+
+@pytest.mark.parametrize("rank,role", [(0, "entrypoint"), (1, "worker")])
+def test_connected_host_mode_survives_installed_to_resolved_launch(rank, role):
+    spec = _spec()
+    spec["security"].update(network_mode="host", host_network=True, devices=["nvidia.com/gpu=all"])
+    spec["topology"].update(name="dual", mode="distributed", node_count=2, world_size=2, rank=rank, role=role, backend="mp")
+    spec["identity"]["execution_sha256"] = execution_identity_sha256(spec)
+    plan = _compile(spec)
+    installed = plan.to_compiled_launch_payload(spec, placement={
+        "endpoint_address": None, "rank": rank, "role": role, "world_size": 2,
+        "local_address": None, "master_address": None, "master_port": 29500,
+        "port": 8888, "reserved_memory_bytes": 4096,
+    })
+    # Exercise stored JSON, then the production start-placement projection.
+    stored = validate_compiled_launch_payload(json.loads(json.dumps(installed)))
+    assert stored["security"]["network_mode"] == "host"
+    resolved = _bind_compiled_execution_plan(stored, placement=RecipeStartPlacement(
+        node_id="spk_" + "a" * 32, rank=rank, role=role, port=8888,
+        reserved_memory_bytes=4096, fabric_address=f"198.19.240.{11 + rank}",
+    ), endpoint_address="192.0.2.10" if rank == 0 else None,
+        master_address="198.19.240.11", master_port=29500, world_size=2)
+    validated = validate_compiled_launch_payload(json.loads(json.dumps(resolved)))
+    assert validated["security"]["network_mode"] == "host"
+    assert validated["security"]["host_network"] is True
+    assert validated["runtime"]["placement"]["local_address"] == f"198.19.240.{11 + rank}"
+    assert canonical_message(validated) == canonical_message(resolved)
+
+
+@pytest.mark.parametrize("mutation", ["single", "three_nodes", "no_gpu", "job", "missing_rendezvous", "mismatched_host_flag", "partial_address", "wrong_master", "ipv6"])
+def test_host_mode_rejects_incomplete_or_unrelated_workloads(mutation):
+    spec = _spec()
+    spec["security"].update(network_mode="host", host_network=True, devices=["nvidia.com/gpu=all"])
+    spec["topology"].update(name="dual", mode="distributed", node_count=2, world_size=2, backend="mp")
+    spec["identity"]["execution_sha256"] = execution_identity_sha256(spec)
+    payload = _compile(spec).to_compiled_launch_payload(spec, placement={
+        "endpoint_address": None, "rank": 0, "role": "entrypoint", "world_size": 2,
+        "local_address": None, "master_address": None, "master_port": 29500,
+        "port": 8888, "reserved_memory_bytes": 4096,
+    })
+    if mutation == "single":
+        payload["topology"].update(mode="single", node_count=1, world_size=1)
+        payload["runtime"]["placement"].update(world_size=1, master_port=None)
+    elif mutation == "three_nodes":
+        payload["topology"].update(node_count=3, world_size=3)
+        payload["runtime"]["placement"]["world_size"] = 3
+    elif mutation == "no_gpu":
+        payload["security"]["devices"] = []
+    elif mutation == "job":
+        payload["endpoint"] = None
+        payload["runtime"]["placement"]["port"] = None
+        payload["job"] = {"interface": "image-job", "input": None, "output_path": "/outputs", "timeout_seconds": 30}
+    elif mutation == "missing_rendezvous":
+        payload["runtime"]["placement"]["master_port"] = None
+    elif mutation == "partial_address":
+        payload["runtime"]["placement"]["local_address"] = "198.19.240.11"
+    elif mutation == "wrong_master":
+        payload["runtime"]["placement"].update(local_address="198.19.240.11", master_address="198.19.240.12")
+    elif mutation == "ipv6":
+        payload["runtime"]["placement"].update(local_address="2001:db8::1", master_address="2001:db8::1")
+    else:
+        payload["security"]["host_network"] = False
+    with pytest.raises(CompiledExecutionPlanError):
+        validate_compiled_launch_payload(payload)

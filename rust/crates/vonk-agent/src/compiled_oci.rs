@@ -19,6 +19,10 @@ use crate::workloads::{
 
 const TMPFS_SPEC: &str = "/tmp:rw,nosuid,nodev,mode=1777,size=1073741824";
 const PID_LIMIT: u64 = 4096;
+const NVIDIA_GPU_DEVICE: &str = "nvidia.com/gpu=all";
+const RDMA_DEVICE: &str = "/dev/infiniband:/dev/infiniband";
+const HOST_MEMLOCK_ULIMIT: &str = "memlock=-1:-1";
+const HOST_STACK_ULIMIT: &str = "stack=67108864:67108864";
 
 #[derive(Debug, Error)]
 pub enum CompiledOciError {
@@ -68,8 +72,8 @@ pub struct OciSecurityOptions {
     pub devices: Vec<String>,
     pub capabilities: Vec<String>,
     pub privileged: bool,
-    /// Network mode is signed by the placement's endpoint/rendezvous fields;
-    /// host networking is never admitted.
+    /// Network mode is signed by the placement's endpoint/rendezvous fields.
+    /// Host networking is the complete two-node fabric shape only.
     pub network_mode: OciNetworkMode,
     pub read_only_root: bool,
     pub no_new_privileges: bool,
@@ -83,6 +87,7 @@ pub struct OciSecurityOptions {
 pub enum OciNetworkMode {
     None,
     Bridge,
+    Host,
 }
 
 impl OciNetworkMode {
@@ -90,7 +95,12 @@ impl OciNetworkMode {
         match self {
             Self::None => "none",
             Self::Bridge => "bridge",
+            Self::Host => "host",
         }
+    }
+
+    pub const fn is_host(self) -> bool {
+        matches!(self, Self::Host)
     }
 }
 
@@ -152,8 +162,19 @@ impl CompiledOciInvocation {
             "--network".to_owned(),
             self.security.network_mode.as_str().to_owned(),
         ]);
+        if self.security.network_mode.is_host() {
+            arguments.extend(["--ipc".to_owned(), "host".to_owned()]);
+        }
         for device in &self.security.devices {
             arguments.extend(["--device".to_owned(), device.clone()]);
+        }
+        if self.security.network_mode.is_host() {
+            arguments.extend([
+                "--ulimit".to_owned(),
+                HOST_MEMLOCK_ULIMIT.to_owned(),
+                "--ulimit".to_owned(),
+                HOST_STACK_ULIMIT.to_owned(),
+            ]);
         }
         for environment in &self.environment {
             arguments.extend([
@@ -296,16 +317,22 @@ pub fn project(
     let command = std::iter::once(plan.runtime.executable.clone())
         .chain(plan.runtime.argv.iter().cloned())
         .collect();
+    let network_mode = match plan.security.network_mode.as_str() {
+        "none" => OciNetworkMode::None,
+        "bridge" => OciNetworkMode::Bridge,
+        "host" => OciNetworkMode::Host,
+        _ => return Err(CompiledOciError::Invalid("unsupported network mode")),
+    };
+    let mut devices = plan.security.devices.clone();
+    if network_mode.is_host() {
+        devices.push(RDMA_DEVICE.to_owned());
+    }
     let security = OciSecurityOptions {
         user: plan.security.user.clone(),
-        devices: plan.security.devices.clone(),
+        devices,
         capabilities: plan.security.capabilities.clone(),
         privileged: plan.security.privileged,
-        network_mode: match plan.security.network_mode.as_str() {
-            "none" => OciNetworkMode::None,
-            "bridge" => OciNetworkMode::Bridge,
-            _ => return Err(CompiledOciError::Invalid("unsupported network mode")),
-        },
+        network_mode,
         read_only_root: plan.security.read_only_root,
         no_new_privileges: plan.security.no_new_privileges,
         memory_bytes: plan.runtime.placement.reserved_memory_bytes,
@@ -368,10 +395,18 @@ fn validate_paths(paths: &CompiledOciPaths) -> Result<(), CompiledOciError> {
 }
 
 fn validate_security(plan: &CompiledExecutionPlan) -> Result<(), CompiledOciError> {
+    let host_mode = plan.security.network_mode.as_str() == "host";
     let bridge_required = plan.runtime.placement.endpoint_address.is_some()
         || plan.runtime.placement.master_port.is_some();
-    let expected_network_mode = if bridge_required { "bridge" } else { "none" };
-    if plan.security.privileged
+    let expected_network_mode = if host_mode {
+        "host"
+    } else if bridge_required {
+        "bridge"
+    } else {
+        "none"
+    };
+    if plan.security.host_network != host_mode
+        || plan.security.privileged
         || !plan.security.capabilities.is_empty()
         || !plan.security.read_only_root
         || !plan.security.no_new_privileges
@@ -381,11 +416,12 @@ fn validate_security(plan: &CompiledExecutionPlan) -> Result<(), CompiledOciErro
             .security
             .devices
             .iter()
-            .any(|value| value != "nvidia.com/gpu=all")
+            .any(|value| value != NVIDIA_GPU_DEVICE)
+        || (host_mode && plan.security.devices.as_slice() != [NVIDIA_GPU_DEVICE])
     {
         return Err(CompiledOciError::Invalid("security override"));
     }
-    if plan.security.host_network {
+    if !host_mode && plan.security.host_network {
         return Err(CompiledOciError::Invalid(
             "host network mode is not authorized",
         ));
@@ -449,6 +485,9 @@ fn ordered_environment(
 }
 
 fn publications(plan: &CompiledExecutionPlan) -> Result<Vec<String>, CompiledOciError> {
+    if plan.security.network_mode.as_str() == "host" {
+        return Ok(Vec::new());
+    }
     let placement = &plan.runtime.placement;
     let mut result = Vec::new();
     if let (Some(endpoint), Some(endpoint_address), Some(port)) =
@@ -760,10 +799,188 @@ mod tests {
         let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
         assert!(matches!(
             project(&plan, &paths()),
-            Err(CompiledOciError::Invalid(
-                "host network mode is not authorized"
-            ))
+            Err(CompiledOciError::Workload(_))
         ));
+    }
+
+    fn host_fabric_fixture() -> Value {
+        let mut value = fixture();
+        value["runtime"]["placement"] = json!({
+            "endpoint_address": "192.168.1.211",
+            "rank": 0,
+            "role": "entrypoint",
+            "world_size": 2,
+            "local_address": "192.168.100.10",
+            "master_address": "192.168.100.10",
+            "master_port": 29500,
+            "port": 8000,
+            "reserved_memory_bytes": 80000000
+        });
+        value["security"]["network_mode"] = json!("host");
+        value["security"]["host_network"] = json!(true);
+        value["security"]["devices"] = json!(["nvidia.com/gpu=all"]);
+        value["topology"] = json!({
+            "name": "dual",
+            "mode": "distributed",
+            "backend": "nccl",
+            "node_count": 2,
+            "world_size": 2,
+            "rank": 0,
+            "role": "entrypoint"
+        });
+        value
+    }
+
+    #[test]
+    fn host_network_mode_emits_complete_fixed_shape() {
+        let plan: CompiledExecutionPlan = serde_json::from_value(host_fabric_fixture()).unwrap();
+        let invocation = project(&plan, &paths()).unwrap();
+        assert_eq!(invocation.security.network_mode, OciNetworkMode::Host);
+        assert_eq!(
+            invocation.security.devices,
+            vec![
+                "nvidia.com/gpu=all".to_owned(),
+                "/dev/infiniband:/dev/infiniband".to_owned()
+            ]
+        );
+        assert!(invocation.publishes.is_empty());
+        assert!(invocation.detach);
+        assert_eq!(invocation.security.user, plan.security.user);
+        assert!(invocation.security.read_only_root);
+        assert!(invocation.security.no_new_privileges);
+        assert!(!invocation.security.privileged);
+        assert!(invocation.security.capabilities.is_empty());
+        let podman = invocation.podman_arguments();
+        let image_index = podman
+            .iter()
+            .position(|item| item == &invocation.image)
+            .unwrap();
+        let launch = &podman[..image_index];
+        assert!(
+            launch
+                .windows(2)
+                .any(|window| window == ["--network", "host"])
+        );
+        assert!(launch.windows(2).any(|window| window == ["--ipc", "host"]));
+        assert!(
+            launch
+                .windows(2)
+                .any(|window| window == ["--device", "nvidia.com/gpu=all"])
+        );
+        assert!(
+            launch
+                .windows(2)
+                .any(|window| window == ["--device", "/dev/infiniband:/dev/infiniband"])
+        );
+        assert!(
+            launch
+                .windows(2)
+                .any(|window| window == ["--ulimit", "memlock=-1:-1"])
+        );
+        assert!(
+            launch
+                .windows(2)
+                .any(|window| window == ["--ulimit", "stack=67108864:67108864"])
+        );
+        assert!(!launch.contains(&"--publish".to_owned()));
+        assert!(launch.contains(&"--cap-drop=ALL".to_owned()));
+        assert!(launch.contains(&"--security-opt=no-new-privileges".to_owned()));
+        assert!(launch.contains(&"--read-only".to_owned()));
+        assert!(
+            invocation
+                .environment
+                .iter()
+                .any(|entry| entry.name == "VONK_WORLD_SIZE" && entry.value == "2")
+        );
+        assert!(
+            invocation
+                .environment
+                .iter()
+                .any(|entry| entry.name == "VONK_RANK" && entry.value == "0")
+        );
+        assert!(
+            invocation
+                .environment
+                .iter()
+                .any(|entry| entry.name == "VONK_LOCAL_ADDR" && entry.value == "192.168.100.10")
+        );
+        assert!(
+            invocation
+                .environment
+                .iter()
+                .any(|entry| entry.name == "VONK_MASTER_ADDR" && entry.value == "192.168.100.10")
+        );
+        assert!(
+            invocation
+                .environment
+                .iter()
+                .any(|entry| entry.name == "VONK_MASTER_PORT" && entry.value == "29500")
+        );
+    }
+
+    #[test]
+    fn host_network_mode_rejects_inconsistent_privilege_and_partial_identity() {
+        let mut value = host_fabric_fixture();
+        value["security"]["privileged"] = json!(true);
+        let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+        assert!(project(&plan, &paths()).is_err());
+
+        let mut value = host_fabric_fixture();
+        value["security"]["host_network"] = json!(false);
+        let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+        assert!(project(&plan, &paths()).is_err());
+
+        let mut value = host_fabric_fixture();
+        value["security"]["devices"] =
+            json!(["nvidia.com/gpu=all", "/dev/infiniband:/dev/infiniband"]);
+        let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+        assert!(project(&plan, &paths()).is_err());
+
+        let mut value = host_fabric_fixture();
+        value["job"] = json!({
+            "interface": "image-job",
+            "input": {
+                "path": "/inputs",
+                "required": true,
+                "media_types": ["application/octet-stream"],
+                "max_bytes": 1024,
+                "slots": null
+            },
+            "output_path": "/outputs",
+            "timeout_seconds": 90
+        });
+        value["endpoint"] = Value::Null;
+        value["runtime"]["placement"]["port"] = Value::Null;
+        let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+        assert!(project(&plan, &paths()).is_err());
+
+        let mut value = host_fabric_fixture();
+        value["topology"]["mode"] = json!("single");
+        value["topology"]["node_count"] = json!(1);
+        value["topology"]["world_size"] = json!(1);
+        value["runtime"]["placement"]["world_size"] = json!(1);
+        let plan: CompiledExecutionPlan = serde_json::from_value(value).unwrap();
+        assert!(project(&plan, &paths()).is_err());
+    }
+
+    #[test]
+    fn host_network_mode_keeps_existing_memory_pid_and_user_bounds() {
+        let plan: CompiledExecutionPlan = serde_json::from_value(host_fabric_fixture()).unwrap();
+        let invocation = project(&plan, &paths()).unwrap();
+        assert_eq!(invocation.security.memory_bytes, 80_000_000);
+        assert_eq!(invocation.security.pids_limit, 4096);
+        assert_eq!(invocation.security.user, "10001:10001");
+        let podman = invocation.podman_arguments();
+        assert!(
+            podman
+                .windows(2)
+                .any(|window| window == ["--pids-limit", "4096"])
+        );
+        assert!(
+            podman
+                .windows(2)
+                .any(|window| window == ["--user", "10001:10001"])
+        );
     }
 
     #[test]

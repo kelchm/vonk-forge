@@ -24,6 +24,27 @@ connected-multinode host mode passes `/dev/infiniband` and permits peer-only
 TCP/UDP on that selected interface/address for native NCCL/RoCE; it does not
 grant arbitrary devices or claim GPUDirect RDMA.
 
+The canonical `vllm` and `sglang` harnesses select host mode only for connected
+distributed GPU endpoints with exactly two nodes and world size two. The signed
+compiled plan carries `network_mode: host` and `host_network: true` together.
+Native execution derives the fixed host IPC, InfiniBand device, unlimited
+memlock and 64 MiB stack settings; recipes cannot supply arbitrary device or
+privilege flags. Single-node workloads and artifact jobs do not gain host mode.
+
+Before starting or inspecting either rank, the privileged helper checks that
+the resolved local address, master address and rendezvous port match the
+root-owned Docker firewall configuration and that its rules are installed.
+Rank zero must own the master address and an authorized host endpoint port;
+rank one must use the configured peer as master and expose no API listener.
+These checks never apply firewall rules or change host configuration. Installed
+plans may have unresolved addresses; launch and retained inspection require
+resolved placement. A missing or mismatched policy fails the normal lifecycle.
+
+This launch contract selects one fabric address per node. Recipes that derive
+an HCA/GID from that address must report the difference from references using
+both NIC functions; a successful single-function launch does not qualify the
+two-function performance expectations below.
+
 `inventory/reports/fabric.json` is committed as explicitly-labelled
 preconfiguration/staging evidence. Do not populate `inventory/cluster.toml` or
 replace its null post-configuration values until the probes below have been

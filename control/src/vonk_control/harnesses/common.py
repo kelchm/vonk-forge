@@ -132,9 +132,17 @@ def validate_projection(
         raise HarnessCompileError("harness image must be digest-pinned")
     if type(projection.network_mode) is not str or (
         projection.network_mode != "none"
-        and not (canonical_argv and projection.network_mode == "bridge")
+        and not (canonical_argv and projection.network_mode in {"bridge", "host"})
     ):
         raise HarnessCompileError("harness projection requires an offline network")
+    if projection.network_mode == "host" and (
+        projection.slug not in {"vllm", "sglang"}
+        or projection.binding is None
+        or projection.binding.topology_node_count != 2
+        or projection.devices != ("nvidia.com/gpu=all",)
+        or projection.input_mount is not None
+    ):
+        raise HarnessCompileError("host networking requires a two-node GPU serving harness")
     if (
         type(projection.architecture) is not str
         or projection.architecture != "linux/arm64"

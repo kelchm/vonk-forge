@@ -490,7 +490,11 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
         placement: &CompiledRuntimePlacement,
     ) -> Result<Vec<String>, OciError> {
         spec.validate()?;
-        placement.validate_bound()?;
+        if spec.security.network_mode.as_str() == "host" {
+            placement.validate_host_bound()?;
+        } else {
+            placement.validate_bound()?;
+        }
         if placement != &spec.runtime.placement {
             return Err(OciError::Runtime);
         }
@@ -1007,6 +1011,9 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
             MAX_COMPILED_EXECUTION_PLAN_SPEC_BYTES as u64,
         )?)?;
         spec.validate()?;
+        if spec.security.network_mode.as_str() == "host" {
+            record.placement.validate_host_bound()?;
+        }
         let installed = self.load_spec(&record.installation_id)?;
         let matches = if spec.job.is_some() {
             same_job_workload(&installed, &spec)

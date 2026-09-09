@@ -13,7 +13,7 @@ fail() {
 }
 
 usage() {
-    echo "usage: vonk-forge-docker-firewall --config PATH apply|check|check-host-port [PORT]" >&2
+    echo "usage: vonk-forge-docker-firewall --config PATH apply|check|check-host-port PORT|check-fabric LOCAL MASTER PORT" >&2
     exit 64
 }
 
@@ -21,11 +21,19 @@ usage() {
 config=${2:-}
 action=${3:-}
 requested_host_port=
+requested_fabric_local=
+requested_fabric_master=
+requested_fabric_port=
 case "$action" in
     apply|check) [ "$#" -eq 3 ] || usage ;;
     check-host-port)
         [ "$#" -eq 4 ] || usage
         requested_host_port=$4 ;;
+    check-fabric)
+        [ "$#" -eq 6 ] || usage
+        requested_fabric_local=$4
+        requested_fabric_master=$5
+        requested_fabric_port=$6 ;;
     *) usage ;;
 esac
 
@@ -155,6 +163,19 @@ if [ "$action" = check-host-port ]; then
         *,$requested_host_port,*) ;;
         *) fail "host endpoint port is not authorized" ;;
     esac
+fi
+
+if [ "$action" = check-fabric ]; then
+    valid_ipv4 "$requested_fabric_local" || fail "requested local fabric address is invalid"
+    valid_ipv4 "$requested_fabric_master" || fail "requested master fabric address is invalid"
+    valid_port "$requested_fabric_port" || fail "requested rendezvous port is invalid"
+    [ "$requested_fabric_local" = "$node_fabric_ip" ] \
+        || fail "local fabric address is not this node"
+    [ "$requested_fabric_master" = "$node_fabric_ip" ] \
+        || [ "$requested_fabric_master" = "$peer_fabric_ip" ] \
+        || fail "master fabric address is not this node or its peer"
+    [ "$requested_fabric_port" = "$rendezvous_port" ] \
+        || fail "rendezvous port does not match site configuration"
 fi
 
 [ "$(id -u)" -eq 0 ] || fail "must run as root"
@@ -306,7 +327,7 @@ require_host_rule() {
         || fail "managed host firewall rule is missing"
 }
 
-if [ "$action" = check ] || [ "$action" = check-host-port ]; then
+if [ "$action" = check ] || [ "$action" = check-host-port ] || [ "$action" = check-fabric ]; then
     verify_rules
     verify_host_rules
     exit 0

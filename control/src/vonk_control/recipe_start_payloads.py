@@ -124,7 +124,9 @@ def _bind_compiled_execution_plan(
     security = payload.get("security")
     if isinstance(security, dict):
         security["network_mode"] = (
-            "bridge"
+            "host"
+            if security.get("host_network") is True
+            else "bridge"
             if endpoint_address is not None or master_port is not None
             else "none"
         )

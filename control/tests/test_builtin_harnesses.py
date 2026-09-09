@@ -111,8 +111,8 @@ def test_platform_metadata_is_strict_and_has_current_capabilities() -> None:
     sglang = next(item for item in CANONICAL_HARNESSES if item.slug == "sglang")
     assert vllm.topology_modes == ("single", "distributed")
     assert sglang.topology_modes == ("single", "distributed")
-    assert vllm.security_exceptions == ("model.trust-remote-code",)
-    assert sglang.security_exceptions == ("model.trust-remote-code",)
+    assert vllm.security_exceptions == ("model.trust-remote-code", "host-network")
+    assert sglang.security_exceptions == ("model.trust-remote-code", "host-network")
     with pytest.raises(ValidationError):
         type(vllm).model_validate({**vllm.model_dump(), "schema_version": 1})
 
@@ -422,6 +422,7 @@ def test_distributed_sglang_compiles_rank_specific_launch(model: ModelDefinition
     recipe = RecipeDefinition.model_validate(raw)
     projection = _projection("sglang", recipe=recipe, model=model, role="worker", rank=1)
 
+    assert projection.network_mode == "host"
     assert "--nnodes" in projection.command
     assert projection.command[projection.command.index("--nnodes") + 1] == "2"
     assert projection.command[projection.command.index("--node-rank") + 1] == "1"

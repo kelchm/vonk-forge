@@ -1154,6 +1154,216 @@ fn runtime_rejects_bridge_host_and_direct_fabric_networks_before_docker() {
 }
 
 #[test]
+fn host_fabric_start_checks_firewall_without_applying_rules() {
+    let (_temp, roots, runner, release) = fixture();
+    let run_id = "40000000-0000-4000-8000-000000000004";
+    let registry_index_digest = format!("sha256:{}", "a".repeat(64));
+    let platform_manifest_digest = format!("sha256:{}", "c".repeat(64));
+    let (archive_body, image_id) = runtime_image_archive();
+    let archive_sha256 = hex_sha256(&archive_body);
+    let image_reference =
+        format!("localhost/vonk/compiled-runtime-{archive_sha256}@{platform_manifest_digest}");
+    let state = roots.agent_data.join("runs").join(run_id);
+    let outputs = state.join("outputs");
+    let metadata = roots.agent_data.join("run-metadata").join(run_id);
+    let model = roots
+        .agent_data
+        .join("installations")
+        .join("installation-1")
+        .join("models")
+        .join("primary")
+        .join("artifact-a.bin");
+    fs::create_dir_all(&outputs).unwrap();
+    fs::create_dir_all(&metadata).unwrap();
+    fs::create_dir_all(model.parent().unwrap()).unwrap();
+    fs::write(&model, b"model artifact").unwrap();
+    fs::write(metadata.join("runtime.json"), b"{}").unwrap();
+    let archive_root = roots.agent_data.join("oci-archives");
+    fs::create_dir_all(&archive_root).unwrap();
+    let archive = archive_root.join(&archive_sha256);
+    fs::write(&archive, &archive_body).unwrap();
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::create_dir_all(&roots.runtime_image_receipts).unwrap();
+    let archive_metadata = fs::metadata(&archive).unwrap();
+    fs::write(
+        roots.runtime_image_receipts.join(&archive_sha256),
+        serde_json::to_vec(&serde_json::json!({
+            "archive_identity": {
+                "bytes": archive_body.len(),
+                "changed_nanoseconds": archive_metadata.ctime_nsec(),
+                "changed_seconds": archive_metadata.ctime(),
+                "device": archive_metadata.dev(),
+                "inode": archive_metadata.ino(),
+                "modified_nanoseconds": archive_metadata.mtime_nsec(),
+                "modified_seconds": archive_metadata.mtime(),
+            },
+            "schema_version": 2,
+            "registry_index_digest": registry_index_digest,
+            "platform_manifest_digest": platform_manifest_digest,
+            "archive_sha256": archive_sha256,
+            "archive_bytes": archive_body.len(),
+            "archive_config_id": image_id,
+            "image_config_id": image_id,
+            "local_image_reference": image_reference,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let docker_arguments = vec![
+        "run".to_owned(),
+        "--detach".to_owned(),
+        "--name".to_owned(),
+        format!("vonk-{run_id}"),
+        "--entrypoint".to_owned(),
+        "/opt/vonk/bin/vllm".to_owned(),
+        "--restart".to_owned(),
+        "no".to_owned(),
+        "--read-only".to_owned(),
+        "--tmpfs".to_owned(),
+        "/tmp:rw,nosuid,nodev,mode=1777,size=1073741824".to_owned(),
+        "--init".to_owned(),
+        "--pull".to_owned(),
+        "never".to_owned(),
+        "--log-driver".to_owned(),
+        "local".to_owned(),
+        "--log-opt".to_owned(),
+        "max-size=10m".to_owned(),
+        "--log-opt".to_owned(),
+        "max-file=3".to_owned(),
+        "--cap-drop=ALL".to_owned(),
+        "--security-opt=no-new-privileges".to_owned(),
+        "--network".to_owned(),
+        "host".to_owned(),
+        "--ipc".to_owned(),
+        "host".to_owned(),
+        "--device".to_owned(),
+        "nvidia.com/gpu=all".to_owned(),
+        "--device".to_owned(),
+        "/dev/infiniband:/dev/infiniband".to_owned(),
+        "--ulimit".to_owned(),
+        "memlock=-1:-1".to_owned(),
+        "--ulimit".to_owned(),
+        "stack=67108864:67108864".to_owned(),
+        "--pids-limit".to_owned(),
+        "4096".to_owned(),
+        "--memory".to_owned(),
+        "1000000000".to_owned(),
+        "--memory-swap".to_owned(),
+        "1000000000".to_owned(),
+        "--shm-size".to_owned(),
+        "134217728".to_owned(),
+        "--user".to_owned(),
+        "10001:10001".to_owned(),
+        "--env".to_owned(),
+        "VONK_RANK=0".to_owned(),
+        "--env".to_owned(),
+        "VONK_WORLD_SIZE=2".to_owned(),
+        "--env".to_owned(),
+        "VONK_LOCAL_ADDR=192.168.100.10".to_owned(),
+        "--env".to_owned(),
+        "VONK_MASTER_ADDR=192.168.100.10".to_owned(),
+        "--env".to_owned(),
+        "VONK_MASTER_PORT=29500".to_owned(),
+        "--env".to_owned(),
+        "VONK_LISTEN_PORT=8000".to_owned(),
+        "--env".to_owned(),
+        "HOME=/outputs/cache/home".to_owned(),
+        "--env".to_owned(),
+        "XDG_CACHE_HOME=/outputs/cache".to_owned(),
+        "--env".to_owned(),
+        "TMPDIR=/outputs/tmp".to_owned(),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,src={},dst=/models/artifact-a.bin,readonly",
+            model.display()
+        ),
+        "--mount".to_owned(),
+        format!("type=bind,src={},dst=/outputs", outputs.display()),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,src={},dst=/outputs/cache",
+            roots
+                .agent_data
+                .join("installations")
+                .join("installation-1")
+                .join("runtime-cache")
+                .display()
+        ),
+        "--mount".to_owned(),
+        format!(
+            "type=bind,src={},dst=/run/vonk/runtime.json,readonly",
+            metadata.join("runtime.json").display()
+        ),
+        image_reference.clone(),
+        "/opt/vonk/bin/vllm".to_owned(),
+    ];
+    let mut arguments = vec![
+        archive_sha256.clone(),
+        registry_index_digest.clone(),
+        platform_manifest_digest.clone(),
+        image_reference.clone(),
+    ];
+    arguments.extend(docker_arguments);
+    let request = runtime_request(HostRuntimeAction::Start, arguments.clone());
+    let digest = write_runtime_request(&roots, &request);
+    let executor = OperationExecutor::new(
+        roots.clone(),
+        release.public_key().as_ref(),
+        runner.clone(),
+        None,
+    )
+    .unwrap();
+    executor
+        .execute(&runtime_operation(&request, digest))
+        .unwrap();
+    let inspect = runtime_request(HostRuntimeAction::RunInspect, arguments);
+    let inspect_digest = write_runtime_request(&roots, &inspect);
+    executor
+        .execute(&runtime_operation(&inspect, inspect_digest))
+        .unwrap();
+    let calls = runner.calls.lock().unwrap();
+    let firewall = calls
+        .iter()
+        .filter(|(program, _)| {
+            program == std::path::Path::new("/usr/lib/vonk-forge/vonk-forge-docker-firewall")
+        })
+        .map(|(_, arguments)| arguments.clone())
+        .collect::<Vec<_>>();
+    assert!(firewall.iter().any(|arguments| arguments
+        == &[
+            "--config".to_owned(),
+            "/etc/vonk-forge-agent/docker-firewall.conf".to_owned(),
+            "check-fabric".to_owned(),
+            "192.168.100.10".to_owned(),
+            "192.168.100.10".to_owned(),
+            "29500".to_owned(),
+        ]));
+    assert!(firewall.iter().any(|arguments| arguments
+        == &[
+            "--config".to_owned(),
+            "/etc/vonk-forge-agent/docker-firewall.conf".to_owned(),
+            "check-host-port".to_owned(),
+            "8000".to_owned(),
+        ]));
+    assert!(
+        !firewall
+            .iter()
+            .any(|arguments| arguments.contains(&"apply".to_owned()))
+    );
+    assert!(calls.iter().any(|(program, arguments)| {
+        program == std::path::Path::new("/usr/bin/docker")
+            && arguments.first().is_some_and(|value| value == "run")
+            && arguments
+                .windows(2)
+                .any(|window| window == ["--network", "host"])
+            && arguments
+                .windows(2)
+                .any(|window| window == ["--ipc", "host"])
+            && !arguments.contains(&"--publish".to_owned())
+    }));
+}
+
+#[test]
 fn runtime_rejects_privilege_and_unmanaged_mounts_before_docker() {
     let (_temp, roots, runner, release) = fixture();
     let executor = OperationExecutor::new(

@@ -2179,7 +2179,8 @@
         "network_mode": {
           "enum": [
             "none",
-            "bridge"
+            "bridge",
+            "host"
           ],
           "title": "Network Mode",
           "type": "string"
