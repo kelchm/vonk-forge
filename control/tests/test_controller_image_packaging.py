@@ -23,6 +23,7 @@ def test_controller_image_pins_and_packages_the_reviewed_skopeo_transport() -> N
     assert "skopeo inspect --tls-verify=true --raw" in dockerfile
     assert "architecture" in dockerfile
     assert '"$TARGETARCH"' in dockerfile
+    assert "expected_child=\"$SKOPEO_AMD64_DIGEST\"" in dockerfile
     assert "expected_child=\"$SKOPEO_ARM64_DIGEST\"" in dockerfile
     assert "COPY --from=skopeo /usr/bin/skopeo /usr/local/lib/skopeo/skopeo.real" in dockerfile
     assert "ARG TARGETARCH" in dockerfile
