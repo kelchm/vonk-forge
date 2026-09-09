@@ -20,10 +20,11 @@ SEMVER_RE = re.compile(rf"^{SEMVER}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 ARCHITECTURE = "linux-arm64"
-# Explicit fork evaluation sequence. The latest ordinary upstream candidate is
-# 0.1.1~dev.553+g2e8b2ec33b26, so 554 orders this evaluation build after every
-# published upstream candidate while the semantic Cargo version stays authoritative.
-EVALUATION_SEQUENCE = 554
+# Explicit fork evaluation sequence. Upstream has since published an ordinary
+# candidate at sequence 554 (source a258e8aaed8a), so 555 orders this evaluation
+# build after every published upstream candidate while the semantic Cargo
+# version stays authoritative.
+EVALUATION_SEQUENCE = 555
 EVALUATION_REPOSITORY = "https://github.com/kelchm/vonk-forge"
 EVALUATION_GITHUB_REPOSITORY = "kelchm/vonk-forge"
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")

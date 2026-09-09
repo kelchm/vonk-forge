@@ -96,7 +96,7 @@ jobs:
           printf '%s\n' "$metadata" >> "$GITHUB_OUTPUT"
           version=$(printf '%s\n' "$metadata" | sed -n 's/^version=//p')
           semantic=$(printf '%s\n' "$metadata" | sed -n 's/^semantic_version=//p')
-          test "$version" = "${semantic}~dev.554+g${GITHUB_SHA:0:12}"
+          test "$version" = "${semantic}~dev.555+g${GITHUB_SHA:0:12}"
 
   compile:
     name: Compile ARM64 evaluation binaries
@@ -160,7 +160,7 @@ jobs:
           actual=$(printf '%s\n' \
             "version=$VERSION" \
             "semantic_version=$SEMANTIC_VERSION" \
-            "sequence=554" \
+            "sequence=555" \
             "source_sha=$GITHUB_SHA" \
             "source_repository=https://github.com/kelchm/vonk-forge" \
             "github_repository=kelchm/vonk-forge" \

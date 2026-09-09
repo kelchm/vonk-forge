@@ -57,12 +57,15 @@ def test_workflow_uses_the_explicit_evaluation_sequence() -> None:
     text = WORKFLOW.read_text()
     helper = HELPER.read_text()
 
-    assert "EVALUATION_SEQUENCE = 554" in helper
+    assert "EVALUATION_SEQUENCE = 555" in helper
     assert "EVALUATION_SEQUENCE = 546" not in helper
+    assert "EVALUATION_SEQUENCE = 554" not in helper
     assert "~dev.546" not in text and "~dev.546" not in helper
     assert "sequence=546" not in text and "sequence=546" not in helper
-    assert '"sequence=554" \\' in text
-    assert 'test "$version" = "${semantic}~dev.554+g${GITHUB_SHA:0:12}"' in text
+    assert "~dev.554" not in text and "~dev.554" not in helper
+    assert "sequence=554" not in text and "sequence=554" not in helper
+    assert '"sequence=555" \\' in text
+    assert 'test "$version" = "${semantic}~dev.555+g${GITHUB_SHA:0:12}"' in text
 
 
 def test_evaluation_workflow_does_not_reuse_upstream_authority_gates() -> None:

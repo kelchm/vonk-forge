@@ -18,7 +18,7 @@ SCRIPT = ROOT / "scripts/evaluation-build-release"
 BUILD = ROOT / "scripts/build-agent-deb"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 VERSION_RE = re.compile(
-    r"^0\.1\.1~dev\.554\+g[0-9a-f]{12}$"
+    r"^0\.1\.1~dev\.555\+g[0-9a-f]{12}$"
 )
 
 
@@ -75,15 +75,15 @@ def test_metadata_emits_cargo_version_with_fixed_sequence_and_source_sha() -> No
     assert result.returncode == 0, result.stderr
     values = dict(line.split("=", 1) for line in result.stdout.splitlines())
     assert values["semantic_version"] == "0.1.1"
-    assert values["sequence"] == "554"
+    assert values["sequence"] == "555"
     assert values["source_sha"] == SHA
-    assert values["version"] == "0.1.1~dev.554+g0123456789ab"
+    assert values["version"] == "0.1.1~dev.555+g0123456789ab"
     assert VERSION_RE.fullmatch(values["version"])
     assert values["source_repository"] == "https://github.com/kelchm/vonk-forge"
     assert values["github_repository"] == "kelchm/vonk-forge"
     assert values["architecture"] == "linux-arm64"
     assert values["arm64_package"] == (
-        "vonk-forge-agent_0.1.1~dev.554+g0123456789ab_arm64.deb"
+        "vonk-forge-agent_0.1.1~dev.555+g0123456789ab_arm64.deb"
     )
     assert values["artifact_name"] == f"vonk-agent-evaluation-{SHA}"
     assert values["compiled_artifact_name"] == (
@@ -142,18 +142,29 @@ def test_same_sequence_distinguishes_source_sha() -> None:
     assert first != second
     assert first.endswith("+g0123456789ab")
     assert second.endswith("+gfedcba987654")
-    assert first.split("+", 1)[0] == second.split("+", 1)[0] == "0.1.1~dev.554"
+    assert first.split("+", 1)[0] == second.split("+", 1)[0] == "0.1.1~dev.555"
 
 
 def test_evaluation_version_sorts_between_physical_and_future_upstream() -> None:
     evaluation = HELPER.evaluation_version("0.1.1", SHA)
     physical_540 = "0.1.1~dev.540+gbbbbbbbbbbbb"
     physical_544 = "0.1.1~dev.544+gaaaaaaaaaaaa"
-    # The latest ordinary upstream candidate this evaluation build is prepared
-    # against; the explicit evaluation sequence must order strictly after it.
+    # The ordinary upstream candidates this evaluation build is prepared
+    # against; the explicit evaluation sequence must order strictly after them.
+    # Retain the actual deployed and selected upstream version anchors.
     upstream_553 = "0.1.1~dev.553+g2e8b2ec33b26"
-    upstream_555 = "0.1.1~dev.555+gcccccccccccc"
-    ordered = [physical_540, physical_544, upstream_553, evaluation, upstream_555]
+    upstream_554 = "0.1.1~dev.554+ga258e8aaed8a"
+    physical_554 = "0.1.1~dev.554+g87e334856a6c"
+    upstream_556 = "0.1.1~dev.556+gcccccccccccc"
+    ordered = [
+        physical_540,
+        physical_544,
+        upstream_553,
+        physical_554,
+        upstream_554,
+        evaluation,
+        upstream_556,
+    ]
 
     def key(version: str) -> tuple[int, str]:
         match = re.fullmatch(
