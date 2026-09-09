@@ -1,0 +1,186 @@
+#!/usr/bin/python3
+"""Fork-only evaluation package metadata, v2 digest, and signing-key checks."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import re
+import stat
+import subprocess
+import sys
+import tomllib
+from collections.abc import Sequence
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+SEMVER_RE = re.compile(rf"^{SEMVER}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+ARCHITECTURE = "linux-arm64"
+# Explicit fork evaluation sequence. The latest ordinary upstream candidate is
+# 0.1.1~dev.553+g2e8b2ec33b26, so 554 orders this evaluation build after every
+# published upstream candidate while the semantic Cargo version stays authoritative.
+EVALUATION_SEQUENCE = 554
+EVALUATION_REPOSITORY = "https://github.com/kelchm/vonk-forge"
+EVALUATION_GITHUB_REPOSITORY = "kelchm/vonk-forge"
+ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+BUILD_DIGEST_PREFIX = b"vonk-agent-build-v2"
+
+
+class EvaluationError(ValueError):
+    """Evaluation metadata or signing-key input is invalid."""
+
+
+def workspace_version(root: Path = ROOT) -> str:
+    try:
+        document = tomllib.loads((root / "Cargo.toml").read_text())
+        version = document["workspace"]["package"]["version"]
+    except (KeyError, OSError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise EvaluationError("Cargo semantic version is invalid") from error
+    if not isinstance(version, str) or SEMVER_RE.fullmatch(version) is None:
+        raise EvaluationError("Cargo semantic version is invalid")
+    return version
+
+
+def evaluation_version(semantic_version: str, source_sha: str) -> str:
+    if SEMVER_RE.fullmatch(semantic_version) is None:
+        raise EvaluationError("Cargo semantic version is invalid")
+    if SHA_RE.fullmatch(source_sha) is None:
+        raise EvaluationError("source SHA is invalid")
+    return f"{semantic_version}~dev.{EVALUATION_SEQUENCE}+g{source_sha[:12]}"
+
+
+def lock_digest(cargo_lock: Path) -> str:
+    try:
+        raw = cargo_lock.read_bytes()
+    except OSError as error:
+        raise EvaluationError("Cargo.lock is unreadable") from error
+    if not raw:
+        raise EvaluationError("Cargo.lock is unreadable")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def v2_build_digest(source_sha: str, architecture: str, cargo_lock_digest: str) -> str:
+    if SHA_RE.fullmatch(source_sha) is None:
+        raise EvaluationError("source SHA is invalid")
+    if architecture != ARCHITECTURE:
+        raise EvaluationError("evaluation architecture is invalid")
+    if FINGERPRINT_RE.fullmatch(cargo_lock_digest) is None:
+        raise EvaluationError("Cargo.lock digest is invalid")
+    payload = (
+        BUILD_DIGEST_PREFIX
+        + b"\0"
+        + source_sha.encode()
+        + b"\0"
+        + architecture.encode()
+        + b"\0"
+        + cargo_lock_digest.encode()
+    )
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def metadata_lines(source_sha: str, cargo_lock: Path, root: Path = ROOT) -> list[str]:
+    semantic_version = workspace_version(root)
+    version = evaluation_version(semantic_version, source_sha)
+    digest = v2_build_digest(source_sha, ARCHITECTURE, lock_digest(cargo_lock))
+    return [
+        f"version={version}",
+        f"semantic_version={semantic_version}",
+        f"sequence={EVALUATION_SEQUENCE}",
+        f"source_sha={source_sha}",
+        f"source_repository={EVALUATION_REPOSITORY}",
+        f"github_repository={EVALUATION_GITHUB_REPOSITORY}",
+        f"architecture={ARCHITECTURE}",
+        "target=aarch64-unknown-linux-gnu",
+        "debian_architecture=arm64",
+        f"build_digest={digest}",
+        f"arm64_package=vonk-forge-agent_{version}_arm64.deb",
+        f"artifact_name=vonk-agent-evaluation-{source_sha}",
+        f"compiled_artifact_name=vonk-agent-evaluation-{source_sha}-compiled-arm64",
+    ]
+
+
+def public_raw32(private_key: Path) -> bytes:
+    try:
+        metadata = private_key.lstat()
+    except OSError as error:
+        raise EvaluationError("evaluation signing key is invalid") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o077
+    ):
+        raise EvaluationError("evaluation signing key permissions are unsafe")
+    completed = subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "pkey",
+            "-in",
+            str(private_key),
+            "-pubout",
+            "-outform",
+            "DER",
+        ],
+        cwd=Path("/"),
+        capture_output=True,
+        check=False,
+    )
+    public_der = completed.stdout
+    if (
+        completed.returncode != 0
+        or not public_der.startswith(ED25519_SPKI_PREFIX)
+        or len(public_der) != len(ED25519_SPKI_PREFIX) + 32
+    ):
+        raise EvaluationError("evaluation signing key is not Ed25519")
+    return public_der[len(ED25519_SPKI_PREFIX) :]
+
+
+def key_fingerprint(raw32: bytes) -> str:
+    if len(raw32) != 32:
+        raise EvaluationError("evaluation signing key is not Ed25519")
+    return hashlib.sha256(raw32).hexdigest()
+
+
+def verify_key(private_key: Path, expected: str) -> str:
+    if FINGERPRINT_RE.fullmatch(expected) is None:
+        raise EvaluationError("evaluation signing key fingerprint is invalid")
+    actual = key_fingerprint(public_raw32(private_key))
+    if not hmac.compare_digest(actual, expected):
+        raise EvaluationError("evaluation signing key fingerprint does not match")
+    return actual
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="evaluation-build-release")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    metadata = subparsers.add_parser("metadata")
+    metadata.add_argument("--source-sha", required=True)
+    metadata.add_argument("--cargo-lock", required=True, type=Path)
+
+    verify = subparsers.add_parser("verify-key")
+    verify.add_argument("--private-key", required=True, type=Path)
+    verify.add_argument("--expected", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if arguments.command == "metadata":
+            print("\n".join(metadata_lines(arguments.source_sha, arguments.cargo_lock)))
+            return 0
+        fingerprint = verify_key(arguments.private_key, arguments.expected)
+        print(f"fingerprint={fingerprint}")
+        return 0
+    except EvaluationError:
+        print("evaluation-build-release: evaluation input is invalid", file=sys.stderr)
+        return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,129 @@
+name: Local evaluation Controller images and setup programs
+
+on:
+  push:
+    branches: [patch/evaluation-fabric-release]
+  workflow_dispatch:
+    inputs:
+      evaluation_branch:
+        description: Exact evaluation branch (patch/evaluation-fabric-release)
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-hex evaluation source commit to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  EVALUATION_BRANCH: patch/evaluation-fabric-release
+
+jobs:
+  setups:
+    # `uses: ./` resolves the reusable workflow and its checkout at this exact
+    # caller commit, so the setup programs are built from the selected source.
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-fabric-release'
+    uses: ./.github/workflows/installer-setups.yml
+  images:
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-fabric-release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - role: api
+            context: .
+            dockerfile: control/Dockerfile
+            target: api
+          - role: worker
+            context: .
+            dockerfile: control/Dockerfile
+            target: worker
+          - role: hermes
+            context: deploy/compose/hermes-agent
+            dockerfile: deploy/compose/hermes-agent/Dockerfile
+            target: managed
+          - role: litellm
+            context: .
+            dockerfile: deploy/compose/litellm/Dockerfile
+            target: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify selected evaluation source
+        env:
+          DISPATCH_BRANCH: ${{ inputs.evaluation_branch }}
+          DISPATCH_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/$EVALUATION_BRANCH"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          case "$GITHUB_EVENT_NAME" in
+            push) test -z "${DISPATCH_BRANCH:-}${DISPATCH_SOURCE_SHA:-}" ;;
+            workflow_dispatch)
+              test "$DISPATCH_BRANCH" = "$EVALUATION_BRANCH"
+              [[ "$DISPATCH_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+              test "$DISPATCH_SOURCE_SHA" = "$GITHUB_SHA"
+              ;;
+            *) exit 64 ;;
+          esac
+          scripts/verify-public-image-inputs
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build exact evaluation image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/kelchm/vonk-forge-evaluation-${{ matrix.role }}:dev-sha-${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/kelchm/vonk-forge
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=evaluation-${{ matrix.role }}
+          cache-to: type=gha,mode=max,scope=evaluation-${{ matrix.role }}
+      - name: Record exact image identity
+        env:
+          ROLE: ${{ matrix.role }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          digest = os.environ['DIGEST']
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', digest)
+          role, source = os.environ['ROLE'], os.environ['GITHUB_SHA']
+          image = f'ghcr.io/kelchm/vonk-forge-evaluation-{role}:dev-sha-{source}@{digest}'
+          Path('evaluation-image.json').write_text(json.dumps({
+              'source': source, 'role': role, 'image': image,
+              'qualification': 'built; physical acceptance pending',
+          }, sort_keys=True) + '\n')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evaluation-image-${{ matrix.role }}-${{ github.sha }}
+          path: evaluation-image.json
+          retention-days: 7
+          if-no-files-found: error
