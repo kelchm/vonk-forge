@@ -861,8 +861,9 @@ impl AgentHttpClient {
         expected_bytes: u64,
         destination: &Path,
     ) -> Result<(), ClientError> {
+        // The content-addressed helper appends the digest to this collection path.
         self.download_content_addressed(
-            &format!("/agent/v1/artifacts/{sha256}"),
+            "/agent/v1/artifacts",
             None,
             sha256,
             expected_bytes,
@@ -2630,6 +2631,142 @@ mod tests {
             Err(ClientError::Protocol)
         ));
         assert_eq!(corrupt_server.join().unwrap().len(), 2);
+    }
+
+    fn artifact_download_client(
+        body: &[u8],
+        offset: usize,
+        etag_sha256: &str,
+    ) -> (AgentHttpClient, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: \"sha256:{}\"\r\nConnection: close\r\n\r\n",
+            body.len() - offset,
+            offset,
+            body.len() - 1,
+            body.len(),
+            etag_sha256,
+        );
+        let remaining = body[offset..].to_vec();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "no artifact request");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("artifact fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.windows(4).any(|value| value == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            // Send the whole response before checking the captured request, so a
+            // wrong endpoint fails an assertion instead of stranding the client.
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(&remaining).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let client = AgentHttpClient::for_http_test(
+            &format!("http://{address}/"),
+            "spk_0123456789abcdef0123456789abcdef",
+        );
+        *client.client.write().unwrap() = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn artifact_download_uses_single_digest_path_and_resumes_verified_bytes() {
+        let body = b"small artifact archive";
+        let sha256 = hex_sha256(body);
+        for offset in [0, 5] {
+            let (client, server) = artifact_download_client(body, offset, &sha256);
+            let root = tempfile::tempdir().unwrap();
+            let destination = root.path().join("image.tar");
+            if offset > 0 {
+                std::fs::write(&destination, &body[..offset]).unwrap();
+            }
+            let result = client
+                .download_artifact(&sha256, body.len() as u64, &destination)
+                .await;
+            let request = server.join().unwrap();
+            assert_eq!(
+                request.lines().next().unwrap(),
+                format!("GET /agent/v1/artifacts/{sha256} HTTP/1.1")
+            );
+            let headers = request.to_ascii_lowercase();
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line == format!("range: bytes={offset}-{}", body.len() - 1))
+            );
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line == format!("if-range: \"sha256:{sha256}\""))
+            );
+            result.unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), body);
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_download_rejects_wrong_response_identity_before_append() {
+        let body = b"small artifact archive";
+        let sha256 = hex_sha256(body);
+        let (client, server) = artifact_download_client(body, 5, &"0".repeat(64));
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("image.tar");
+        std::fs::write(&destination, &body[..5]).unwrap();
+        let result = client
+            .download_artifact(&sha256, body.len() as u64, &destination)
+            .await;
+        let request = server.join().unwrap();
+        assert_eq!(
+            request.lines().next().unwrap(),
+            format!("GET /agent/v1/artifacts/{sha256} HTTP/1.1")
+        );
+        assert!(matches!(result, Err(ClientError::Protocol)));
+        assert_eq!(std::fs::read(&destination).unwrap(), &body[..5]);
+    }
+
+    #[tokio::test]
+    async fn artifact_download_rejects_corrupt_resumed_prefix() {
+        let body = b"small artifact archive";
+        let sha256 = hex_sha256(body);
+        let (client, server) = artifact_download_client(body, 5, &sha256);
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("image.tar");
+        std::fs::write(&destination, b"WRONG").unwrap();
+        let result = client
+            .download_artifact(&sha256, body.len() as u64, &destination)
+            .await;
+        let request = server.join().unwrap();
+        assert_eq!(
+            request.lines().next().unwrap(),
+            format!("GET /agent/v1/artifacts/{sha256} HTTP/1.1")
+        );
+        assert!(matches!(result, Err(ClientError::Protocol)));
+        let mut corrupt = b"WRONG".to_vec();
+        corrupt.extend_from_slice(&body[5..]);
+        assert_eq!(std::fs::read(&destination).unwrap(), corrupt);
     }
 
     #[tokio::test]
