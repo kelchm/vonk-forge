@@ -153,11 +153,19 @@ def check_catalog(root: Path) -> dict[str, object]:
                 )
                 # Supply only the simulated fleet addresses. Memory and port
                 # semantics come from the production placement constructor.
-                if placement["port"] is not None:
+                if placement["port"] is not None and role_entry.endpoint_owner:
                     placement["endpoint_address"] = "100.100.20.30"
                 if world_size > 1:
+                    owner_index = next(
+                        i for i, item in enumerate(recipe.topology.roles)
+                        if item.endpoint_owner
+                    )
+                    owner_rank = sum(item.count for item in recipe.topology.roles[:owner_index])
+                    master_address = f"100.100.20.{owner_rank + 2}"
                     placement["local_address"] = f"100.100.20.{rank + 2}"
-                    placement["master_address"] = "100.100.20.2"
+                    placement["master_address"] = master_address
+                    if placement["endpoint_address"] is not None:
+                        placement["endpoint_address"] = master_address
                 payload = plan.to_compiled_launch_payload(
                     runtime,
                     placement=placement,
