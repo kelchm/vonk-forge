@@ -2345,7 +2345,8 @@ mod tests {
         let (_, second, _) =
             persisted_plan_installation(data.path(), second_id.clone(), plan.clone());
         let first_digest = plan.identity.recipe_revision_sha256.clone();
-        let corrupt_receipt = "a".repeat(64);
+        let corrupt_receipt = "b".repeat(64);
+        assert_ne!(corrupt_receipt, plan.identity.recipe_revision_sha256);
         authorize_installation(&first, &first_digest);
         authorize_installation(&second, &corrupt_receipt);
         let runner = NoProcess;
