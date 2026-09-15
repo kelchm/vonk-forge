@@ -25,6 +25,11 @@ HOST_ARTIFACT_DOMAIN = b"VONK-HOST-ARTIFACT-V1\x00"
 RECIPE_RUN_OBSERVATION_RECEIPT_AUTHORITY = "vonk.recipe-run-observation-helper"
 RECIPE_RUN_OBSERVATION_RECEIPT_DOMAIN = b"VONK-RECIPE-RUN-OBSERVATION-RECEIPT-V1\x00"
 MAX_HOST_HELPER_GRANT_SECONDS = 300
+# The privileged helper reads at most this many encoded request bytes. A
+# nonempty JSON string item needs at least four bytes including its separator;
+# the count bound must not reject a request that fits the complete byte budget.
+MAX_HOST_RUNTIME_REQUEST_BYTES = 64 * 1024
+MAX_HOST_RUNTIME_ARGUMENTS = MAX_HOST_RUNTIME_REQUEST_BYTES // 4
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Signature = Annotated[str, Field(pattern=r"^[0-9a-f]{128}$")]
@@ -96,7 +101,7 @@ class HostRuntimeRequest(WireModel):
     operation_id: Uuid4Text
     attempt: int = Field(ge=1, le=2**31 - 1)
     fence: Uuid4Text
-    arguments: list[Annotated[str, Field(min_length=1, max_length=4096, pattern=r"^[^\x00\r\n]+$")]] = Field(max_length=512)
+    arguments: list[Annotated[str, Field(min_length=1, max_length=4096, pattern=r"^[^\x00\r\n]+$")]] = Field(max_length=MAX_HOST_RUNTIME_ARGUMENTS)
     observation: RecipeRunInspectionBinding | None = None
     installation_id: Uuid4Text | None = Field(
         default=None, exclude_if=lambda value: value is None
@@ -104,6 +109,8 @@ class HostRuntimeRequest(WireModel):
 
     @model_validator(mode="after")
     def bind_runtime_inspection(self) -> HostRuntimeRequest:
+        if len(canonical_message(self)) > MAX_HOST_RUNTIME_REQUEST_BYTES:
+            raise ValueError("encoded runtime request exceeds the helper byte budget")
         argument_free = self.action in {"runtime-preflight", "installation-cleanup"}
         if (not self.arguments) != argument_free:
             raise ValueError("runtime arguments do not match the action")

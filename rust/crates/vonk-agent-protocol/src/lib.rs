@@ -59,7 +59,11 @@ use thiserror::Error;
 #[cfg(test)]
 use uuid::Uuid;
 
-pub const MAX_HOST_RUNTIME_ARGUMENTS: usize = 512;
+pub const MAX_HOST_RUNTIME_REQUEST_BYTES: usize = 64 * 1024;
+// A nonempty JSON string item needs at least four bytes with its separator.
+// Bound the projected launch by the helper's encoded request budget, rather
+// than conflating Docker mount/environment options with engine argv items.
+pub const MAX_HOST_RUNTIME_ARGUMENTS: usize = MAX_HOST_RUNTIME_REQUEST_BYTES / 4;
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_COMPILED_EXECUTION_PLAN_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_COMPILED_EXECUTION_PLAN_CLAIM_BYTES: usize =
@@ -158,6 +162,7 @@ impl HostRuntimeRequest {
             || self.arguments.iter().any(|value| {
                 value.is_empty() || value.len() > 4096 || value.contains(['\0', '\r', '\n'])
             })
+            || canonical_json(self)?.len() > MAX_HOST_RUNTIME_REQUEST_BYTES
         {
             return Err(ProtocolError::Identity("host runtime request"));
         }
@@ -244,6 +249,45 @@ mod installation_cleanup_contract_tests {
             let parsed: HostRuntimeRequest = serde_json::from_value(raw).unwrap();
             assert!(parsed.validate().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod host_runtime_budget_tests {
+    use super::*;
+
+    #[test]
+    fn projected_options_fit_the_encoded_request_budget() {
+        let mut request = HostRuntimeRequest {
+            schema_version: 1,
+            action: HostRuntimeAction::Start,
+            job_id: Uuid::new_v4(),
+            operation_id: Uuid::new_v4(),
+            attempt: 1,
+            fence: Uuid::new_v4(),
+            arguments: vec!["x".to_owned(); 513],
+            observation: None,
+            installation_id: None,
+        };
+        request.validate().unwrap();
+        request.arguments = vec!["x".repeat(4096); 16];
+        assert!(request.validate().is_err());
+
+        request.arguments = vec!["a".repeat(4096); 15];
+        request.arguments.push("λ\"\\".repeat(100));
+        let remaining = MAX_HOST_RUNTIME_REQUEST_BYTES - canonical_json(&request).unwrap().len();
+        request
+            .arguments
+            .last_mut()
+            .unwrap()
+            .push_str(&"z".repeat(remaining));
+        assert_eq!(
+            canonical_json(&request).unwrap().len(),
+            MAX_HOST_RUNTIME_REQUEST_BYTES
+        );
+        request.validate().unwrap();
+        request.arguments.last_mut().unwrap().push('z');
+        assert!(request.validate().is_err());
     }
 }
 

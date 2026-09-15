@@ -19,8 +19,9 @@ use vonk_agent_protocol::generated::{
     InstallVonkDebOperation, RestartVonkUnitOperation, ScheduleRebootOperation,
 };
 use vonk_agent_protocol::{
-    HostRuntimeAction, HostRuntimeRequest, PackageRollbackAuthority, RecipeRunObservationOutcome,
-    canonical_json, hex_sha256, parse_strict,
+    HostRuntimeAction, HostRuntimeRequest, MAX_HOST_RUNTIME_REQUEST_BYTES,
+    PackageRollbackAuthority, RecipeRunObservationOutcome, canonical_json, hex_sha256,
+    parse_strict,
 };
 use wait_timeout::ChildExt;
 
@@ -29,7 +30,7 @@ use crate::protocol::{ContainerRuntimeAction, HostOperation, RestartUnit, artifa
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RUNTIME_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: u64 = 4096;
-const MAX_RUNTIME_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_RUNTIME_REQUEST_BYTES: u64 = MAX_HOST_RUNTIME_REQUEST_BYTES as u64;
 const MAX_RUNTIME_CONFIG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMPILED_MODEL_FILES: usize = 4096;
 const MAX_COMPILED_MODEL_PATH_CHARS: usize = 512;
@@ -3235,6 +3236,64 @@ mod tests {
     };
 
     const RUN_ID: &str = "40000000-0000-4000-8000-000000000004";
+
+    #[test]
+    fn runtime_request_file_reader_preserves_the_encoded_budget() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use vonk_agent_protocol::{HostRuntimeAction, HostRuntimeRequest, canonical_json};
+
+        struct NoCommand;
+        impl CommandRunner for NoCommand {
+            fn run(&self, _: &Path, _: &[String]) -> Result<CommandOutput, String> {
+                panic!("request-file validation must not execute a command")
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let roots = ManagedRoots::under(directory.path());
+        fs::create_dir_all(&roots.runtime_requests).unwrap();
+        let executor = OperationExecutor::new(roots.clone(), &[0; 32], NoCommand, None).unwrap();
+        let mut request = HostRuntimeRequest {
+            schema_version: 1,
+            action: HostRuntimeAction::Start,
+            job_id: uuid::Uuid::new_v4(),
+            operation_id: uuid::Uuid::new_v4(),
+            attempt: 1,
+            fence: uuid::Uuid::new_v4(),
+            arguments: vec!["x".to_owned(); 513],
+            observation: None,
+            installation_id: None,
+        };
+        let mut bodies = vec![canonical_json(&request).unwrap()];
+        request.arguments = vec!["a".repeat(4096); 15];
+        request.arguments.push("x".to_owned());
+        let remaining = 65_536 - canonical_json(&request).unwrap().len();
+        request
+            .arguments
+            .last_mut()
+            .unwrap()
+            .push_str(&"z".repeat(remaining));
+        bodies.push(canonical_json(&request).unwrap());
+        request.arguments.last_mut().unwrap().push('z');
+        bodies.push(canonical_json(&request).unwrap());
+        for body in bodies {
+            let digest = hex_sha256(&body);
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(roots.runtime_requests.join(format!("{digest}.json")))
+                .unwrap();
+            file.write_all(&body).unwrap();
+            file.sync_all().unwrap();
+            let result = executor.read_runtime_request(&digest);
+            if body.len() <= 65_536 {
+                assert_eq!(canonical_json(&result.unwrap()).unwrap(), body);
+            } else {
+                assert!(matches!(result, Err(OperationError::UnsafePath)));
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct MissingContainerRunner;
