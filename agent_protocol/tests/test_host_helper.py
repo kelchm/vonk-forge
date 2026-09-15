@@ -132,3 +132,34 @@ def test_runtime_cleanup_identity_is_required_only_for_cleanup(model) -> None:
     explicit_null = model.model_validate(ordinary | {"installation_id": None})
     assert canonical_message(omitted) == canonical_message(explicit_null)
     assert "installation_id" not in json.loads(canonical_message(explicit_null))
+
+
+def test_runtime_request_budget_counts_encoded_bytes_not_projected_options() -> None:
+    # A sharded model produces two Docker options per mount/environment entry;
+    # 512 projected items are not the same limit as 512 engine arguments.
+    document = {
+        "schema_version": 1,
+        "action": "start",
+        "job_id": "20000000-0000-4000-8000-000000000002",
+        "operation_id": "30000000-0000-4000-8000-000000000003",
+        "attempt": 1,
+        "fence": "40000000-0000-4000-8000-000000000004",
+        "arguments": ["x"] * 513,
+    }
+    request = HostRuntimeRequest.model_validate_json(json.dumps(document))
+    assert json.loads(canonical_message(request))["arguments"] == document["arguments"]
+
+    # Count is small and each value is legal, but the encoded request is too big.
+    document["arguments"] = ["x" * 4096] * 16
+    with pytest.raises(ValidationError, match="encoded runtime request"):
+        HostRuntimeRequest.model_validate_json(json.dumps(document))
+
+    # Include UTF-8 and JSON escapes: character totals are not wire-byte totals.
+    document["arguments"] = ["a" * 4096] * 15 + ['λ"\\' * 100]
+    remaining = 65536 - len(canonical_message(document))
+    document["arguments"][-1] += "z" * remaining
+    boundary = HostRuntimeRequest.model_validate_json(json.dumps(document))
+    assert len(canonical_message(boundary)) == 65536
+    document["arguments"][-1] += "z"
+    with pytest.raises(ValidationError, match="encoded runtime request"):
+        HostRuntimeRequest.model_validate_json(json.dumps(document))

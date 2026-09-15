@@ -157,6 +157,14 @@ Bootstrap also has one response: the helper authority key is required, and the
 address and hostname list are explicit even when they are `null` and `[]`.
 There is no setup-schema selector or older bootstrap variant.
 
+Host runtime requests are bounded by their complete canonical UTF-8 JSON size:
+64 KiB, including identity and inspection fields. Agent-side and Pydantic
+validation enforce the same budget as the helper's bounded file reader before
+grant issuance or execution. The argument count ceiling derives from that byte
+budget; it is not the engine's argv limit, because each model mount and
+environment entry adds container-runtime options. Per-argument limits, exact
+mount and command validation, signatures, and operation fences still apply.
+
 Certificate activation atomically carries a live operation's credential binding
 from its valid active source certificate to the replacement. Its attempt, fence,
 and lease deadline do not change. Expired, superseded, completed, or revoked

@@ -3472,7 +3472,7 @@
             "pattern": "^[^\\x00\\r\\n]+$",
             "type": "string"
           },
-          "maxItems": 512,
+          "maxItems": 16384,
           "title": "Arguments",
           "type": "array"
         },
