@@ -10,26 +10,29 @@ controller_image=$1
 source_reference=$2
 architecture=$3
 case "$architecture" in
-  linux/amd64) expected_child=sha256:022fb8d5f3b0e16493ec454f4d2523dfafe6b01b16bf157e0fdd56506cc7adc7 ;;
-  linux/arm64) expected_child=sha256:32bae1283b4b6fe2edf8b3f4f105ad964c0f48a44183c613b8f42281da1405da ;;
+  linux/amd64) expected_child=sha256:0e392474a4383b733038b85eff26ade929d2ff10e8deead25a6add3ed79fb362 ;;
+  linux/arm64) expected_child=sha256:807f42a95c0f05f397eb505b577b6de49048b865c4e29146d1231324c27e1e59 ;;
   *) echo "unsupported architecture: $architecture" >&2; exit 2 ;;
 esac
 if [[ "$source_reference" != *@sha256:* ]]; then
   echo "source must be digest pinned" >&2
   exit 2
 fi
-test "$source_reference" = "quay.io/skopeo/stable@sha256:b9ca6a549aa71990d50ab390a8bddf606a6689379026aa24e7f4f70b5a43fbcd"
+test "$source_reference" = "quay.io/skopeo/stable:v1.22.2-immutable@sha256:4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810"
+
+# skopeo accepts digest-only references, unlike Docker FROM.
+skopeo_source="quay.io/skopeo/stable@${source_reference##*@}"
 
 labels=$(docker image inspect --format '{{index .Config.Labels "io.vonk.skopeo.index-digest"}} {{index .Config.Labels "io.vonk.skopeo.'"${architecture#linux/}"'-digest"}}' "$controller_image")
 read -r index_label child_label <<<"$labels"
-test "$index_label" = sha256:b9ca6a549aa71990d50ab390a8bddf606a6689379026aa24e7f4f70b5a43fbcd
+test "$index_label" = sha256:4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810
 test "$child_label" = "$expected_child"
 test "$(docker image inspect --format '{{.Architecture}}' "$controller_image")" = "${architecture#linux/}"
 # inspect's Digest identifies the index even when an architecture is selected.
 # Read its descriptor to verify the exact child, rather than comparing the
 # index digest with a platform-manifest digest.
 source_child=$(skopeo inspect --tls-verify=true --raw \
-  "docker://${source_reference}" | python3 -c '
+  "docker://${skopeo_source}" | python3 -c '
 import json, sys
 platform = sys.argv[1].split("/", 1)
 matches = [entry["digest"] for entry in json.load(sys.stdin)["manifests"]
@@ -46,7 +49,7 @@ docker run --rm \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
   --tmpfs /var/tmp:rw,nosuid,nodev,noexec,size=256m \
   --user 10001:10001 \
-  --env SOURCE_REFERENCE="$source_reference" \
+  --env SOURCE_REFERENCE="$skopeo_source" \
   --env EXPECTED_ARCHITECTURE="$architecture" \
   --entrypoint /bin/sh \
   "$controller_image" \

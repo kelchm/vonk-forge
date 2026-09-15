@@ -6,21 +6,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "control/Dockerfile"
 
-SKOPEO_INDEX = "sha256:b9ca6a549aa71990d50ab390a8bddf606a6689379026aa24e7f4f70b5a43fbcd"
-SKOPEO_AMD64 = "sha256:022fb8d5f3b0e16493ec454f4d2523dfafe6b01b16bf157e0fdd56506cc7adc7"
-SKOPEO_ARM64 = "sha256:32bae1283b4b6fe2edf8b3f4f105ad964c0f48a44183c613b8f42281da1405da"
+SKOPEO_INDEX = "sha256:4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810"
+SKOPEO_AMD64 = "sha256:0e392474a4383b733038b85eff26ade929d2ff10e8deead25a6add3ed79fb362"
+SKOPEO_ARM64 = "sha256:807f42a95c0f05f397eb505b577b6de49048b865c4e29146d1231324c27e1e59"
 
 
 def test_controller_image_pins_and_packages_the_reviewed_skopeo_transport() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
-    assert f"ARG SKOPEO_IMAGE=quay.io/skopeo/stable@{SKOPEO_INDEX}" in dockerfile
+    assert f"ARG SKOPEO_IMAGE=quay.io/skopeo/stable:v1.22.2-immutable@{SKOPEO_INDEX}" in dockerfile
     assert f"ARG SKOPEO_INDEX_DIGEST={SKOPEO_INDEX}" in dockerfile
     assert f"ARG SKOPEO_AMD64_DIGEST={SKOPEO_AMD64}" in dockerfile
     assert f"ARG SKOPEO_ARM64_DIGEST={SKOPEO_ARM64}" in dockerfile
     assert "FROM ${SKOPEO_IMAGE} AS skopeo" in dockerfile
     assert "ARG TARGETARCH" in dockerfile
     assert "skopeo inspect --tls-verify=true --raw" in dockerfile
+    assert "docker://quay.io/skopeo/stable@${SKOPEO_INDEX_DIGEST}" in dockerfile
+    assert dockerfile.index("rm -rf /etc/ssl/certs") < dockerfile.index(
+        "COPY --from=skopeo /etc/ssl /etc/ssl"
+    )
     assert "architecture" in dockerfile
     assert '"$TARGETARCH"' in dockerfile
     assert "expected_child=\"$SKOPEO_AMD64_DIGEST\"" in dockerfile

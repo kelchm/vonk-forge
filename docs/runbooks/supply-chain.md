@@ -155,3 +155,22 @@ Before promotion, dispatch an unchanged reviewed request twice from accepted
 `oci_manifest_digest` values to match. BuildKit index digests, invocation
 provenance, SBOM namespaces, and signed-bundle digests are run-specific and may
 differ. An executable-manifest mismatch rejects both candidates.
+
+## Skopeo build source
+
+The Controller transport uses Skopeo 1.22.2 from the digest-pinned
+`quay.io/skopeo/stable:v1.22.2-immutable` image recorded in
+`deploy/compose/images.lock.json`. A superseded digest on the moving stable
+tag can be garbage-collected by the registry. Review a refresh against the
+primary OCI index and both Linux platform manifests, then update the Dockerfile,
+`verify-controller-skopeo`, their tests, the image lock and generated SBOM together.
+Docker FROM keeps both tag and digest; Skopeo inspection uses the bare repository
+and digest because Skopeo rejects references containing both.
+
+The immutable source has `/etc/ssl/certs` as a symlink into `/etc/pki/tls`;
+the runtime build removes the Python base's conflicting directory before
+copying the complete Skopeo certificate trees. Qualify API and worker images
+on amd64 and arm64 with the rootless TLS inspection/copy verifier before use.
+This scoped packaging repair follows upstream commit
+`8170f67cddf2eb85ece8f7700be45e48fecebf81`; it does not require changing other
+Controller dependencies or the database.
