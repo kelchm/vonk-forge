@@ -1088,16 +1088,23 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
         installation_id: &str,
         expected_recipe_digest: &str,
     ) -> Result<(), OciError> {
-        let installation = managed_path(self.data_root, "installations", installation_id)?;
-        let metadata = fs::symlink_metadata(&installation)?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        self.load_uninstall_spec(installation_id, expected_recipe_digest)
+            .map(|_| ())
+    }
+
+    fn load_uninstall_spec(
+        &self,
+        installation_id: &str,
+        expected_recipe_digest: &str,
+    ) -> Result<CompiledExecutionPlan, OciError> {
+        let plan = self.read_persisted_spec(installation_id)?;
+        plan.validate_storage()?;
+        if self.recipe_digest(installation_id)? != expected_recipe_digest
+            || plan.identity.recipe_revision_sha256 != expected_recipe_digest
+        {
             return Err(OciError::Artifact);
         }
-        self.load_spec(installation_id)?;
-        if self.recipe_digest(installation_id)? != expected_recipe_digest {
-            return Err(OciError::Artifact);
-        }
-        Ok(())
+        Ok(plan)
     }
 
     pub fn runtime_cache_present(&self, installation_id: &str) -> Result<bool, OciError> {
@@ -1125,10 +1132,9 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
         Ok(())
     }
 
-    /// Remove one installation's materialized model files when the signed
-    /// Controller plan proves that this node is the last consumer of the
-    /// model. The global distribution cache is reusable shared state and is
-    /// retained for future installs.
+    /// Remove only this installation's materialized model files. Other
+    /// installations and the shared distribution cache retain their own files
+    /// (including hard links to the same content) for future use.
     pub fn uninstall_with_model_cleanup(
         &self,
         installation_id: &str,
@@ -1153,17 +1159,8 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
         if !lower_hex(model_content_sha256, 64) {
             return Err(OciError::Artifact);
         }
-        let (_, persisted) = self.load_persisted_spec(installation_id)?;
-        if self.recipe_digest(installation_id)? != expected_recipe_digest
-            || !spec_references_model(&persisted, model_content_sha256)
-        {
-            return Err(OciError::Artifact);
-        }
-        let remaining = self.installed_specs_except(&[installation_id])?;
-        if remaining
-            .iter()
-            .any(|(_, spec)| spec_references_model(spec, model_content_sha256))
-        {
+        let persisted = self.load_uninstall_spec(installation_id, expected_recipe_digest)?;
+        if !spec_references_model(&persisted, model_content_sha256) {
             return Err(OciError::Artifact);
         }
         let removed_model_bytes =
@@ -1213,6 +1210,7 @@ impl<R: ProcessRunner> OciRuntime<'_, R> {
             }
             let (_, persisted) = self.load_persisted_spec(installation_id)?;
             if self.recipe_digest(installation_id)? != *expected_recipe_digest
+                || persisted.identity.recipe_revision_sha256 != *expected_recipe_digest
                 || !spec_references_model(&persisted, model_content_sha256)
             {
                 return Err(OciError::Artifact);
@@ -2290,7 +2288,7 @@ mod tests {
     fn explicit_model_cleanup_removes_materialized_install_and_retains_shared_cache() {
         let data = tempdir().unwrap();
         let (installation_id, installation, plan) = persisted_installation(data.path());
-        let recipe_digest = "1".repeat(64);
+        let recipe_digest = plan.identity.recipe_revision_sha256.clone();
         authorize_installation(&installation, &recipe_digest);
 
         let cached = data.path().join("distribution").join("models");
@@ -2317,14 +2315,87 @@ mod tests {
     }
 
     #[test]
+    fn recipe_cleanup_preserves_valid_same_model_installation() {
+        let data = tempdir().unwrap();
+        let (installation_id, installation, plan) = persisted_installation(data.path());
+        let other_id = "10000000-0000-4000-8000-000000000001".to_owned();
+        let (_, other, _) = persisted_plan_installation(data.path(), other_id, plan.clone());
+        let digest = plan.identity.recipe_revision_sha256.clone();
+        authorize_installation(&installation, &digest);
+        authorize_installation(&other, &digest);
+        let other_spec = fs::read(other.join("spec.json")).unwrap();
+        let runner = NoProcess;
+        let runtime = runtime(data.path(), &runner);
+        assert_eq!(
+            runtime
+                .uninstall_with_model_cleanup(&installation_id, &digest, &"e".repeat(64))
+                .unwrap(),
+            16
+        );
+        assert!(!installation.exists());
+        assert_eq!(fs::read(other.join("spec.json")).unwrap(), other_spec);
+        assert!(other.join("models").is_dir());
+    }
+
+    #[test]
+    fn model_cleanup_rejects_inconsistent_target_identity_before_any_removal() {
+        let data = tempdir().unwrap();
+        let (first_id, first, plan) = persisted_installation(data.path());
+        let second_id = "10000000-0000-4000-8000-000000000001".to_owned();
+        let (_, second, _) =
+            persisted_plan_installation(data.path(), second_id.clone(), plan.clone());
+        let first_digest = plan.identity.recipe_revision_sha256.clone();
+        let corrupt_receipt = "a".repeat(64);
+        authorize_installation(&first, &first_digest);
+        authorize_installation(&second, &corrupt_receipt);
+        let runner = NoProcess;
+        let runtime = runtime(data.path(), &runner);
+        assert!(
+            runtime
+                .uninstall_model(
+                    &[(first_id, first_digest), (second_id, corrupt_receipt)],
+                    &"e".repeat(64),
+                )
+                .is_err()
+        );
+        assert!(first.exists());
+        assert!(second.exists());
+    }
+
+    #[test]
+    fn model_cleanup_retains_other_installation_scan() {
+        for malformed in [false, true] {
+            let data = tempdir().unwrap();
+            let (installation_id, installation, plan) = persisted_installation(data.path());
+            let other_id = "10000000-0000-4000-8000-000000000001".to_owned();
+            let (_, other, _) = persisted_plan_installation(data.path(), other_id, plan.clone());
+            let digest = plan.identity.recipe_revision_sha256.clone();
+            authorize_installation(&installation, &digest);
+            authorize_installation(&other, &digest);
+            if malformed {
+                fs::write(other.join("spec.json"), b"invalid unrelated metadata").unwrap();
+            }
+            let runner = NoProcess;
+            let runtime = runtime(data.path(), &runner);
+            assert!(
+                runtime
+                    .uninstall_model(&[(installation_id, digest)], &"e".repeat(64))
+                    .is_err()
+            );
+            assert!(installation.exists());
+            assert!(other.exists());
+        }
+    }
+
+    #[test]
     fn model_cleanup_retry_skips_an_installation_removed_after_validation() {
         let data = tempdir().unwrap();
         let (first_id, first, plan) = persisted_installation(data.path());
         let second_id = "10000000-0000-4000-8000-000000000001".to_owned();
         let (_, second, _) =
             persisted_plan_installation(data.path(), second_id.clone(), plan.clone());
-        let first_digest = "1".repeat(64);
-        let second_digest = "2".repeat(64);
+        let first_digest = plan.identity.recipe_revision_sha256.clone();
+        let second_digest = plan.identity.recipe_revision_sha256.clone();
         authorize_installation(&first, &first_digest);
         authorize_installation(&second, &second_digest);
         let installations = vec![
@@ -2355,7 +2426,7 @@ mod tests {
     {
         let data = tempdir().unwrap();
         let (installation_id, installation, plan) = persisted_installation(data.path());
-        let recipe_digest = "3".repeat(64);
+        let recipe_digest = plan.identity.recipe_revision_sha256.clone();
         authorize_installation(&installation, &recipe_digest);
 
         let mut other_value = compiled_plan();
@@ -2395,7 +2466,7 @@ mod tests {
     fn routine_recipe_uninstall_retains_shared_model_cache() {
         let data = tempdir().unwrap();
         let (installation_id, installation, plan) = persisted_installation(data.path());
-        let recipe_digest = "2".repeat(64);
+        let recipe_digest = plan.identity.recipe_revision_sha256.clone();
         authorize_installation(&installation, &recipe_digest);
         let cached = data
             .path()

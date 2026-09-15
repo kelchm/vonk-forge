@@ -5,6 +5,14 @@ service host can be a NAS or any Docker Compose-capable Linux machine. A cluster
 can contain one, two, or more Vonk Forge GPU nodes; no product contract fixes the count or
 uses a GPU node hostname or IP address as identity.
 
+Recipe uninstall validates the requested installation's current typed metadata, recipe
+identity, and artifact paths, then removes only that installation directory.
+It does not scan unrelated installations or require the removed workload to
+pass launch admission. Shared distribution objects and other installations'
+materialized copies remain intact, including any hard links to the same bytes.
+Invalid metadata or inaccessible storage within the requested installation
+still rejects removal.
+
 Each GPU node is independently installed and enrolled. Its stable `spk_…` identity
 comes from the node key and certificate, while its current management address is
 fresh authenticated presence evidence. DHCP reservations are useful operationally
