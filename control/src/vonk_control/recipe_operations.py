@@ -581,6 +581,18 @@ class RecipeOperationService:
             )
             if existing is not None:
                 return existing
+            active_uninstall = session.scalar(
+                select(Job.id)
+                .where(
+                    Job.kind == "recipe.uninstall",
+                    Job.state.in_({"queued", "running", "waiting-for-operator"}),
+                    Job.payload["owner_kind"].as_string() == "installation",
+                    Job.payload["owner_id"].as_string() == installation_id,
+                )
+                .limit(1)
+            )
+            if active_uninstall is not None:
+                raise RecipeOperationConflict("recipe installation has an active uninstall")
             if installation.state == "installed":
                 completed = session.scalar(
                     select(Job)
@@ -1462,7 +1474,12 @@ class RecipeOperationService:
                 plan = self._uninstall_plan_in_session(
                     session, installation_id, lock=True
                 )
-                if not plan.allowed or plan.plan_digest != plan_digest:
+                if not plan.allowed:
+                    raise RecipeOperationConflict(
+                        "uninstall plan is stale or blocked: "
+                        + "; ".join(reason.code for reason in plan.blockers)
+                    )
+                if plan.plan_digest != plan_digest:
                     raise RecipeOperationConflict("uninstall plan is stale or blocked")
                 job = self._queue_in_session(
                     session,
@@ -1491,6 +1508,7 @@ class RecipeOperationService:
                             },
                         )
                         for node in plan.nodes
+                        if node.state != "uninstalled"
                     ),
                     authority_digest=plan.installation_authority_digest,
                     now=now,
@@ -2847,7 +2865,7 @@ class RecipeOperationService:
             select(Job)
             .where(
                 Job.kind == "recipe.uninstall",
-                Job.state.in_({"queued", "running"}),
+                Job.state.in_({"queued", "running", "waiting-for-operator"}),
                 Job.payload["owner_id"].as_string() == installation_id,
             )
             .order_by(Job.id)

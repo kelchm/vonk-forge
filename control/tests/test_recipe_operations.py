@@ -3230,7 +3230,119 @@ def test_model_deletion_requires_explicit_stop_for_every_active_run(
         )
 
 
-def test_uninstall_unknown_bytes_and_active_runs_block_without_implicit_stop(
+@pytest.mark.parametrize("cleanup_state", ["queued", "waiting-for-operator"])
+@pytest.mark.parametrize("first_node_removed", [False, True])
+@pytest.mark.parametrize("retain_shared_model", [False, True])
+def test_failed_uninstall_resumes_only_unfinished_nodes_after_service_restart(
+    tmp_path: Path, first_node_removed: bool, retain_shared_model: bool, cleanup_state: str
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(
+        tmp_path, nodes=2
+    )
+    install_request = str(uuid.uuid4())
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=install_request
+    )
+    retained = (
+        installed_recipe(
+            service, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+        )
+        if retain_shared_model else None
+    )
+    initial = service.preview_uninstall(target.owner_id)
+    first = service.uninstall(
+        target.owner_id, plan_digest=initial.plan_digest,
+        actor="admin", request_id=str(uuid.uuid4()),
+    )
+    service.record_node_result(
+        first.id, nodes[0], succeeded=first_node_removed,
+        evidence={"removed": True} if first_node_removed else {"code": "cleanup.failed"},
+    )
+    service.record_node_result(
+        first.id, nodes[1], succeeded=False, evidence={"code": "cleanup.failed"},
+    )
+    assert service.get(first.id).state == "failed"
+    # Recreate the actual lifecycle consumer over persisted rows; do not repair
+    # installation states, saved plans or byte estimates in the fixture.
+    recovered = RecipeOperationService(
+        sessions,
+        install_admission=service._install_admission,
+        run_admission=service._run_admission,
+        agent_jobs=RecordingQueue(),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    preview = recovered.preview_uninstall(target.owner_id)
+    assert preview.allowed is True
+    assert preview.bytes_removed is None
+    assert preview.blockers == ()
+    assert [reason.code for reason in preview.warnings] == ["uninstall.bytes_unknown"]
+    assert preview.model_impact.effect == (
+        "recipe-only" if retain_shared_model else "recipe-and-unused-model"
+    )
+    request_id = str(uuid.uuid4())
+    retry = recovered.uninstall(
+        target.owner_id, plan_digest=preview.plan_digest,
+        actor="admin", request_id=request_id,
+    )
+    assert recovered.uninstall(
+        target.owner_id, plan_digest=preview.plan_digest,
+        actor="admin", request_id=request_id,
+    ) == retry
+    with sessions() as session:
+        children = tuple(session.scalars(select(AgentOperation).where(
+            AgentOperation.parent_job_id == retry.id
+        )))
+    expected_nodes = set(nodes[1:] if first_node_removed else nodes)
+    assert {child.node_id for child in children} == expected_nodes
+    assert {child.payload["installation_id"] for child in children} == {target.owner_id}
+    assert {child.payload["plan_digest"] for child in children} == {target.plan_digest}
+    assert {child.payload["cleanup_model_content_sha256"] for child in children} == {
+        None if retain_shared_model else preview.model_impact.model_content_sha256
+    }
+    # Exercise both active execution and the persisted uncertain-lease state.
+    # Neither permits a new owner mutation before cleanup is resolved.
+    with sessions.begin() as session:
+        session.get(Job, retry.id).state = cleanup_state
+    assert recovered.start_installation(
+        target.owner_id, actor="admin", request_id=install_request
+    ).id == target.id
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        recovered.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+    with sessions() as session:
+        assert session.get(RecipeInstallation, target.owner_id).state == "failed"
+        assert set(session.scalars(select(InstallationNode.state).where(
+            InstallationNode.installation_id == target.owner_id
+        ))) == ({"uninstalled", "failed"} if first_node_removed else {"failed"})
+    active = recovered.preview_uninstall(target.owner_id)
+    assert active.allowed is False
+    assert "uninstall.operation_active" in [reason.code for reason in active.blockers]
+    for node_id in expected_nodes:
+        recovered.record_node_result(
+            retry.id, node_id, succeeded=True, evidence={"removed": True}
+        )
+    assert recovered.get(retry.id).state == "succeeded"
+    with sessions() as session:
+        installed = session.get(RecipeInstallation, target.owner_id)
+        assert installed is not None and installed.state == "uninstalled"
+        assert set(session.scalars(select(InstallationNode.state).where(
+            InstallationNode.installation_id == target.owner_id
+        ))) == {"uninstalled"}
+        assert not list(session.scalars(select(ResourceReservation).where(
+            ResourceReservation.owner_id == target.owner_id,
+            ResourceReservation.state == "active",
+        )))
+        if retained is not None:
+            other = session.get(RecipeInstallation, retained.owner_id)
+            assert other is not None and other.state == "installed"
+            assert list(session.scalars(select(ResourceReservation).where(
+                ResourceReservation.owner_id == retained.owner_id,
+                ResourceReservation.state == "active",
+            )))
+
+
+def test_uninstall_warns_on_unknown_bytes_but_blocks_active_runs_without_implicit_stop(
     tmp_path: Path,
 ) -> None:
     sessions, service, _queue, mapping_id, build_id, nodes = setup_services(
@@ -3285,9 +3397,10 @@ def test_uninstall_unknown_bytes_and_active_runs_block_without_implicit_stop(
         stored_installation.state = "partial"
         failed_node.state = "failed"
     unknown = service.preview_uninstall(installation.owner_id)
-    assert unknown.allowed is False
+    assert unknown.allowed is True
     assert unknown.bytes_removed is None
-    assert [reason.code for reason in unknown.blockers] == ["uninstall.bytes_unknown"]
+    assert unknown.blockers == ()
+    assert [reason.code for reason in unknown.warnings] == ["uninstall.bytes_unknown"]
     assert unknown.nodes[1].installed_bytes is None
 
 

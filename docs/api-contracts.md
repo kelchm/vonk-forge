@@ -265,6 +265,13 @@ lifecycle test proves the tested orchestration. Neither alone proves that every
 model works on physical Spark hardware.
 
 
+Unknown reclaimable bytes in an uninstall preview remain unknown and produce a
+warning. Cleanup still requires exact installation authority, immutable node
+membership, stopped workloads, no active cleanup operation and a matching plan
+digest. Retrying failed cleanup queues only nodes without successful removal
+receipts; successful removal receipts and shared cached objects remain retained.
+
+
 ## Nested contract coverage
 
 The 7 September 2026 application inventory contains 136 routes. Its 115

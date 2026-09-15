@@ -724,13 +724,14 @@ class TelemetryMaintenance:
         for metric in metric_rows:
             if not metric.sample_count:
                 continue
+            # A process label may change without changing the stable series
+            # key. Splitting on that label would duplicate the bucket PK.
             identity = (
                 metric.metric_name,
                 metric.key,
                 metric.scope,
                 metric.device_id,
                 metric.process_id,
-                metric.process_name,
                 metric.interface_name,
                 metric.run_id,
                 metric.unit,
@@ -763,6 +764,13 @@ class TelemetryMaintenance:
                 high = max(current.maximum, incoming.maximum)
                 aggregates[identity] = replace(
                     current,
+                    # Rows are ordered by bucket time; retain the latest label
+                    # without letting a later missing label erase it.
+                    process_name=(
+                        incoming.process_name
+                        if incoming.process_name is not None
+                        else current.process_name
+                    ),
                     count=current.count + incoming.count,
                     minimum=min(current.minimum, incoming.minimum),
                     mean=high,
@@ -773,6 +781,13 @@ class TelemetryMaintenance:
                 count = current.count + incoming.count
                 aggregates[identity] = replace(
                     current,
+                    # Rows are ordered by bucket time; retain the latest label
+                    # without letting a later missing label erase it.
+                    process_name=(
+                        incoming.process_name
+                        if incoming.process_name is not None
+                        else current.process_name
+                    ),
                     count=count,
                     minimum=min(current.minimum, incoming.minimum),
                     mean=(

@@ -1651,3 +1651,79 @@ def test_sqlite_late_sample_dirty_marker_survives_claim_transaction(
             (60, NODE_A, start, "cpu_utilization_percent"),
         )
         assert (metric.sample_count, metric.mean) == (2, 20)
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+@pytest.mark.parametrize("aggregation", ["mean", "max"])
+def test_quarter_hour_process_rename_preserves_statistics_and_identity(
+    sessions, request, backend, aggregation,
+) -> None:
+    if backend == "postgres":
+        engine = request.getfixturevalue("postgres_engine")
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(engine, expire_on_commit=False)
+        with sessions.begin() as session:
+            session.add(AgentNode(node_id=NODE_A, state="active", capabilities=[]))
+
+    start = NOW.replace(minute=0)
+    identities = [
+        (3529636, "GPU-original", "run-original"),
+        (3529637, "GPU-original", "run-original"),
+        (3529636, "GPU-other", "run-original"),
+        (3529636, "GPU-original", "run-other"),
+    ]
+    # Insert in reverse time order: the query must choose the latest non-null
+    # label by bucket time, not insertion order, and retain it through nulls.
+    samples = [
+        (0, "VLLM::Worker", 1, 10.0),
+        (1, None, 2, 20.0),
+        (2, "VLLM::Worker_TP1", 3, 30.0),
+        (3, None, 4, 40.0),
+    ]
+    with sessions.begin() as session:
+        for minute, label, count, value in reversed(samples):
+            timestamp = start + timedelta(minutes=minute)
+            session.add(NodeTelemetryRollupBucket(
+                resolution_seconds=60, node_id=NODE_A, bucket_start=timestamp,
+                source_sample_count=count, gap_samples=0,
+            ))
+            for pid, device, run in identities:
+                metadata = {
+                    "key": "gpu.process_memory_bytes", "scope": "accelerator",
+                    "device_id": device, "process_id": pid, "process_name": label,
+                    "interface_name": None, "run_id": run, "unit": "bytes",
+                    "source": "nvml", "measurement_kind": "measured",
+                    "aggregation": aggregation,
+                }
+                session.add(NodeTelemetryRollupMetric(
+                    resolution_seconds=60, node_id=NODE_A, bucket_start=timestamp,
+                    metric_name=telemetry_maintenance._series_metric_name(
+                        SimpleNamespace(**metadata)
+                    ),
+                    sample_count=count, minimum=value, mean=value, maximum=value,
+                    **metadata,
+                ))
+
+    # Flush/commit exercises the real composite PK. Recomputing must replace
+    # the bucket cleanly rather than accumulating or dropping observations.
+    for _ in range(2):
+        with sessions.begin() as session:
+            telemetry_maintenance.TelemetryMaintenance._recompute_quarter_hour(
+                session, NODE_A, start,
+            )
+        with sessions() as session:
+            rows = session.scalars(select(NodeTelemetryRollupMetric).where(
+                NodeTelemetryRollupMetric.resolution_seconds == 900,
+                NodeTelemetryRollupMetric.node_id == NODE_A,
+            )).all()
+            assert len(rows) == len(identities)
+            assert {(row.process_id, row.device_id, row.run_id) for row in rows} == set(
+                identities
+            )
+            for row in rows:
+                assert row.process_name == "VLLM::Worker_TP1"
+                assert row.sample_count == 10
+                assert row.minimum == 10.0
+                assert row.maximum == 40.0
+                assert row.mean == (40.0 if aggregation == "max" else 30.0)
+                assert row.aggregation == aggregation
