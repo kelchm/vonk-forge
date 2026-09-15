@@ -2,11 +2,11 @@ name: Fork evaluation native package
 
 on:
   push:
-    branches: [patch/evaluation-uninstall-scope]
+    branches: [patch/evaluation-runtime-argument-budget]
   workflow_dispatch:
     inputs:
       evaluation_branch:
-        description: Exact evaluation branch (patch/evaluation-uninstall-scope)
+        description: Exact evaluation branch (patch/evaluation-runtime-argument-budget)
         required: true
         type: string
       source_sha:
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 env:
-  EVALUATION_BRANCH: patch/evaluation-uninstall-scope
+  EVALUATION_BRANCH: patch/evaluation-runtime-argument-budget
 
 concurrency:
   group: vonk-evaluation-release-${{ github.sha }}
@@ -96,7 +96,7 @@ jobs:
           printf '%s\n' "$metadata" >> "$GITHUB_OUTPUT"
           version=$(printf '%s\n' "$metadata" | sed -n 's/^version=//p')
           semantic=$(printf '%s\n' "$metadata" | sed -n 's/^semantic_version=//p')
-          test "$version" = "${semantic}~dev.555+g${GITHUB_SHA:0:12}"
+          test "$version" = "${semantic}~dev.556+g${GITHUB_SHA:0:12}"
 
   compile:
     name: Compile ARM64 evaluation binaries
@@ -160,7 +160,7 @@ jobs:
           actual=$(printf '%s\n' \
             "version=$VERSION" \
             "semantic_version=$SEMANTIC_VERSION" \
-            "sequence=555" \
+            "sequence=556" \
             "source_sha=$GITHUB_SHA" \
             "source_repository=https://github.com/kelchm/vonk-forge" \
             "github_repository=kelchm/vonk-forge" \
