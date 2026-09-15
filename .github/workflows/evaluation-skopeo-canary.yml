@@ -1,0 +1,64 @@
+name: Exact evaluation Skopeo transport canary
+on:
+  push:
+    branches: [patch/evaluation-skopeo-canary]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+  packages: read
+jobs:
+  transport:
+    if: github.repository == 'kelchm/vonk-forge' && github.ref == 'refs/heads/patch/evaluation-skopeo-canary'
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [api, worker]
+        architecture: [amd64, arm64]
+        include:
+          - architecture: amd64
+            runner: ubuntu-latest
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: harness
+      - name: Check out the exact image candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kelchm/vonk-forge
+          ref: 48fc92fa39f156617e6e893d796b92f5c5191817
+          persist-credentials: false
+          path: candidate
+      - name: Install host manifest inspection tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify receipt, platform image and rootless transport
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_ROLE: ${{ matrix.role }}
+          CANARY_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          python3 harness/scripts/evaluation-skopeo-canary \
+            --role "$CANARY_ROLE" --architecture "$CANARY_ARCHITECTURE" \
+            --candidate "$GITHUB_WORKSPACE/candidate" \
+            --output "$RUNNER_TEMP/skopeo-proof"
+      - name: Retain actual transport and image evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: evaluation-skopeo-${{ matrix.role }}-${{ matrix.architecture }}-${{ github.sha }}
+          path: ${{ runner.temp }}/skopeo-proof
+          retention-days: 7
+          if-no-files-found: error

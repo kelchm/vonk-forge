@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Qualify already-built, exact evaluation transport images on disposable CI."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SOURCE = "48fc92fa39f156617e6e893d796b92f5c5191817"
+PRODUCER = 34915600812
+REPOSITORY = "kelchm/vonk-forge"
+SOURCE_BRANCH = "patch/evaluation-uninstall-scope"
+HARNESS_BRANCH = "refs/heads/patch/evaluation-skopeo-canary"
+SKOPEO = (
+    "quay.io/skopeo/stable:v1.22.2-immutable@sha256:"
+    "4a16d57b37617a04b3d643079a477a2848efe892dffcdf0ce56df4262b65f810"
+)
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def validate_producer(run: dict) -> None:
+    require(
+        run.get("id") == PRODUCER
+        and run.get("head_sha") == SOURCE
+        and run.get("head_branch") == SOURCE_BRANCH
+        and run.get("head_repository", {}).get("full_name") == REPOSITORY
+        and run.get("path") == ".github/workflows/evaluation-controller-images.yml"
+        and run.get("event") in {"push", "workflow_dispatch"}
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "success",
+        "producer must be the successful exact source-bound evaluation image run",
+    )
+
+
+def validate_receipt(receipt: dict, role: str) -> str:
+    prefix = f"ghcr.io/kelchm/vonk-forge-evaluation-{role}:dev-sha-{SOURCE}@sha256:"
+    image = receipt.get("image", "")
+    require(
+        role in {"api", "worker"}
+        and receipt.get("source") == SOURCE
+        and receipt.get("role") == role
+        and isinstance(image, str)
+        and re.fullmatch(re.escape(prefix) + "[0-9a-f]{64}", image) is not None,
+        "image receipt must bind the exact candidate, role and immutable image",
+    )
+    return image
+
+
+def verified_json(raw: bytes, digest: str) -> dict:
+    require("sha256:" + hashlib.sha256(raw).hexdigest() == digest, "manifest digest mismatch")
+    result = json.loads(raw)
+    require(isinstance(result, dict), "manifest must be an object")
+    return result
+
+
+def selected_child(index: dict, architecture: str) -> str:
+    matches = [
+        entry["digest"] for entry in index.get("manifests", [])
+        if entry.get("platform", {}).get("os") == "linux"
+        and entry.get("platform", {}).get("architecture") == architecture
+    ]
+    require(len(matches) == 1, "index must contain exactly one requested Linux platform")
+    require(re.fullmatch("sha256:[0-9a-f]{64}", matches[0]) is not None, "invalid child digest")
+    return matches[0]
+
+
+def validate_local_image(local: dict, architecture: str, manifest: dict) -> None:
+    labels = local.get("Config", {}).get("Labels", {})
+    require(local.get("Architecture") == architecture and local.get("Os") == "linux", "local image platform mismatch")
+    require(local.get("Id") == manifest.get("config", {}).get("digest"), "pulled image config does not match selected manifest")
+    require(labels.get("org.opencontainers.image.revision") == SOURCE, "image source label mismatch")
+    require(labels.get("org.opencontainers.image.source") == "https://github.com/kelchm/vonk-forge", "image repository label mismatch")
+
+
+def execute(args: argparse.Namespace) -> int:
+    args.output.mkdir(parents=True, exist_ok=False)
+    report = {
+        "kind": "evaluation-controller-skopeo-canary", "ok": False,
+        "candidate_source": SOURCE, "producer_run": PRODUCER,
+        "harness_source": os.environ.get("GITHUB_SHA"),
+        "harness_run": os.environ.get("GITHUB_RUN_ID"),
+        "role": args.role, "platform": f"linux/{args.architecture}",
+        "host": {"system": platform.system(), "machine": platform.machine(), "kernel": platform.release()},
+        "skopeo_source": SKOPEO, "commands": [],
+        "physical_gpu_acceptance": False, "deployment_acceptance": False,
+    }
+
+    def command(name: str, argv: list[str], *, timeout: int = 300) -> bytes:
+        start = time.monotonic()
+        result = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+        (args.output / f"{name}.stdout").write_bytes(result.stdout)
+        (args.output / f"{name}.stderr").write_bytes(result.stderr)
+        report["commands"].append({"name": name, "exit_code": result.returncode, "seconds": time.monotonic() - start})
+        require(result.returncode == 0, f"{name} failed; see retained stdout/stderr")
+        return result.stdout
+
+    try:
+        require(os.environ.get("GITHUB_REPOSITORY") == REPOSITORY, "fork only")
+        require(os.environ.get("GITHUB_REF") == HARNESS_BRANCH, "explicit harness branch only")
+        require(os.environ.get("GITHUB_EVENT_NAME") in {"push", "workflow_dispatch"}, "unsupported trigger")
+        require(platform.system() == "Linux" and platform.machine() == {"amd64": "x86_64", "arm64": "aarch64"}[args.architecture], "native Linux runner required")
+        report["host"]["skopeo_version"] = command("host-skopeo-version", ["skopeo", "--version"]).decode().strip()
+        report["host"]["skopeo_package_version"] = command("host-skopeo-package", ["dpkg-query", "-W", "-f=${Version}", "skopeo"]).decode().strip()
+        report["host"]["docker_version"] = json.loads(command("host-docker-version", ["docker", "version", "--format", "{{json .}}"]))
+        actual = command("candidate-source", ["git", "-C", str(args.candidate), "rev-parse", "HEAD"]).decode().strip()
+        require(actual == SOURCE, "candidate checkout source mismatch")
+        require(command("candidate-clean", ["git", "-C", str(args.candidate), "status", "--porcelain"]) == b"", "candidate checkout is dirty")
+        verifier = args.candidate / "scripts/verify-controller-skopeo"
+        committed = command("candidate-verifier", ["git", "-C", str(args.candidate), "show", f"{SOURCE}:scripts/verify-controller-skopeo"])
+        require(verifier.read_bytes() == committed, "verifier bytes differ from candidate source")
+        report["verifier_sha256"] = hashlib.sha256(committed).hexdigest()
+        run = json.loads(command("producer", ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{PRODUCER}"]))
+        validate_producer(run)
+        name = f"evaluation-image-{args.role}-{SOURCE}"
+        artifacts = json.loads(command("artifacts", ["gh", "api", f"repos/{REPOSITORY}/actions/runs/{PRODUCER}/artifacts?per_page=100"]))
+        require(artifacts.get("total_count", 101) <= 100, "artifact inventory exceeds bound")
+        selected = [a for a in artifacts["artifacts"] if a["name"] == name and not a["expired"]]
+        require(len(selected) == 1, "exact unexpired image artifact required")
+        report["artifact"] = {key: selected[0].get(key) for key in ("id", "name", "digest", "size_in_bytes")}
+        receipt_dir = args.output / "receipt"
+        command("download-receipt", ["gh", "run", "download", str(PRODUCER), "--repo", REPOSITORY, "--name", name, "--dir", str(receipt_dir)])
+        receipt_path = receipt_dir / "evaluation-image.json"
+        require(not receipt_path.is_symlink() and receipt_path.stat().st_size <= 16384, "unsafe image receipt")
+        image = validate_receipt(json.loads(receipt_path.read_bytes()), args.role)
+        report["image"] = image
+        index = verified_json(command("image-index", ["docker", "buildx", "imagetools", "inspect", "--raw", image]), image.split("@", 1)[1])
+        child_digest = selected_child(index, args.architecture)
+        child_ref = image.split("@", 1)[0] + "@" + child_digest
+        child = verified_json(command("image-manifest", ["docker", "buildx", "imagetools", "inspect", "--raw", child_ref]), child_digest)
+        report["platform_manifest_digest"] = child_digest
+        command("pull", ["docker", "pull", "--platform", f"linux/{args.architecture}", image], timeout=600)
+        local = json.loads(command("local-image", ["docker", "image", "inspect", image]))
+        require(len(local) == 1, "one pulled image required")
+        validate_local_image(local[0], args.architecture, child)
+        report["container_config_digest"] = local[0]["Id"]
+        command("rootless-transport", [str(verifier), image, SKOPEO, f"linux/{args.architecture}"], timeout=900)
+        report["rootless_tls_inspect_copy_archive"] = True
+        report["ok"] = True
+    except (ValueError, OSError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+        report["error"] = str(error)
+    finally:
+        (args.output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    return 0 if report["ok"] else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--role", choices=("api", "worker"), required=True)
+    parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
+    parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return execute(parser.parse_args())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
