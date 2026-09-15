@@ -79,7 +79,7 @@ def local_bundle(tmp_path, signing_key, kind="nas"):
             {
                 "schema_version": 2,
                 "channel": "dev",
-                "version": "0.1.1~dev.554+g88480698a951",
+                "version": "0.1.1~dev.555+g88480698a951",
                 "generation": generation,
                 "artifacts": artifacts,
                 "bootstraps": {
@@ -207,6 +207,6 @@ def test_spark_bootstrap_stages_versioned_package(tmp_path, signing_key):
     assert result.returncode == 0, result.stderr
     args = marker.read_text().splitlines()
     assert args[0] == "--package"
-    assert Path(args[1]).name == "vonk-forge-agent_0.1.1~dev.554+g88480698a951_arm64.deb"
+    assert Path(args[1]).name == "vonk-forge-agent_0.1.1~dev.555+g88480698a951_arm64.deb"
     assert Path(str(marker) + ".package").read_bytes() == package.read_bytes()
     assert not Path(args[1]).exists()

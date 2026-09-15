@@ -2,11 +2,11 @@ name: Local evaluation Controller images and setup programs
 
 on:
   push:
-    branches: [patch/evaluation-fabric-release]
+    branches: [patch/evaluation-uninstall-scope]
   workflow_dispatch:
     inputs:
       evaluation_branch:
-        description: Exact evaluation branch (patch/evaluation-fabric-release)
+        description: Exact evaluation branch (patch/evaluation-uninstall-scope)
         required: true
         type: string
       source_sha:
@@ -18,16 +18,16 @@ permissions:
   contents: read
 
 env:
-  EVALUATION_BRANCH: patch/evaluation-fabric-release
+  EVALUATION_BRANCH: patch/evaluation-uninstall-scope
 
 jobs:
   setups:
     # `uses: ./` resolves the reusable workflow and its checkout at this exact
     # caller commit, so the setup programs are built from the selected source.
-    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-fabric-release'
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-uninstall-scope'
     uses: ./.github/workflows/installer-setups.yml
   images:
-    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-fabric-release'
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-uninstall-scope'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:

@@ -20,7 +20,7 @@ def test_evaluation_workflow_is_scoped_to_the_evaluation_fork() -> None:
 
     assert text.startswith("name: Fork evaluation native package\n")
     assert "  workflow_dispatch:\n" in text
-    assert "  push:\n    branches: [patch/evaluation-fabric-release]\n" in text
+    assert "  push:\n    branches: [patch/evaluation-uninstall-scope]\n" in text
     assert "pull_request:" not in text
     assert "workflow_call:" not in text
     assert "workflow_run:" not in text
@@ -39,7 +39,7 @@ def test_every_job_binds_this_exact_evaluation_branch_and_source() -> None:
     text = WORKFLOW.read_text()
     jobs = [workflow_job(text, name) for name in ("authority", "compile", "sign")]
 
-    assert "  EVALUATION_BRANCH: patch/evaluation-fabric-release\n" in text
+    assert "  EVALUATION_BRANCH: patch/evaluation-uninstall-scope\n" in text
     assert "evaluation_branch:\n        description:" in text
     assert "source_sha:\n        description:" in text
     for job in jobs:
@@ -57,12 +57,12 @@ def test_workflow_uses_the_explicit_evaluation_sequence() -> None:
     text = WORKFLOW.read_text()
     helper = HELPER.read_text()
 
-    assert "EVALUATION_SEQUENCE = 554" in helper
+    assert "EVALUATION_SEQUENCE = 555" in helper
     assert "EVALUATION_SEQUENCE = 546" not in helper
     assert "~dev.546" not in text and "~dev.546" not in helper
     assert "sequence=546" not in text and "sequence=546" not in helper
-    assert '"sequence=554" \\' in text
-    assert 'test "$version" = "${semantic}~dev.554+g${GITHUB_SHA:0:12}"' in text
+    assert '"sequence=555" \\' in text
+    assert 'test "$version" = "${semantic}~dev.555+g${GITHUB_SHA:0:12}"' in text
 
 
 def test_evaluation_workflow_does_not_reuse_upstream_authority_gates() -> None:

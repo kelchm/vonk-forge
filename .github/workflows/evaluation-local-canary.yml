@@ -1,11 +1,11 @@
 name: Local evaluation native canary
 on:
   push:
-    branches: [patch/evaluation-fabric-release]
+    branches: [patch/evaluation-uninstall-scope]
   workflow_dispatch:
     inputs:
       evaluation_branch:
-        description: Exact evaluation branch (patch/evaluation-fabric-release)
+        description: Exact evaluation branch (patch/evaluation-uninstall-scope)
         required: true
         type: string
       source_sha:
@@ -24,11 +24,11 @@ permissions:
   contents: read
 jobs:
   canary:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-fabric-release'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-uninstall-scope'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
-      EVALUATION_BRANCH: patch/evaluation-fabric-release
+      EVALUATION_BRANCH: patch/evaluation-uninstall-scope
       VONK_EVALUATION_DISPOSABLE: "1"
       VONK_RECIPE_LIBRARY_ROOT: ${{ github.workspace }}/.recipe-library
       VONK_SYNTHETIC_CANARY_INDEX: tests/fixtures/canonical-synthetic-canary/index.json
