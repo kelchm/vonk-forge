@@ -18,7 +18,7 @@ SCRIPT = ROOT / "scripts/evaluation-build-release"
 BUILD = ROOT / "scripts/build-agent-deb"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 VERSION_RE = re.compile(
-    r"^0\.1\.1~dev\.557\+g[0-9a-f]{12}$"
+    r"^0\.1\.1~dev\.558\+g[0-9a-f]{12}$"
 )
 
 
@@ -75,15 +75,15 @@ def test_metadata_emits_cargo_version_with_fixed_sequence_and_source_sha() -> No
     assert result.returncode == 0, result.stderr
     values = dict(line.split("=", 1) for line in result.stdout.splitlines())
     assert values["semantic_version"] == "0.1.1"
-    assert values["sequence"] == "557"
+    assert values["sequence"] == "558"
     assert values["source_sha"] == SHA
-    assert values["version"] == "0.1.1~dev.557+g0123456789ab"
+    assert values["version"] == "0.1.1~dev.558+g0123456789ab"
     assert VERSION_RE.fullmatch(values["version"])
     assert values["source_repository"] == "https://github.com/kelchm/vonk-forge"
     assert values["github_repository"] == "kelchm/vonk-forge"
     assert values["architecture"] == "linux-arm64"
     assert values["arm64_package"] == (
-        "vonk-forge-agent_0.1.1~dev.557+g0123456789ab_arm64.deb"
+        "vonk-forge-agent_0.1.1~dev.558+g0123456789ab_arm64.deb"
     )
     assert values["artifact_name"] == f"vonk-agent-evaluation-{SHA}"
     assert values["compiled_artifact_name"] == (
@@ -142,15 +142,15 @@ def test_same_sequence_distinguishes_source_sha() -> None:
     assert first != second
     assert first.endswith("+g0123456789ab")
     assert second.endswith("+gfedcba987654")
-    assert first.split("+", 1)[0] == second.split("+", 1)[0] == "0.1.1~dev.557"
+    assert first.split("+", 1)[0] == second.split("+", 1)[0] == "0.1.1~dev.558"
 
 
 def test_evaluation_version_sorts_after_deployed_local_package() -> None:
     evaluation = HELPER.evaluation_version("0.1.1", SHA)
-    deployed_555 = "0.1.1~dev.555+g48fc92fa39f1"
+    deployed_557 = "0.1.1~dev.557+g61b3e4cc1adf"
     # These are ordering fixtures, not claims about a current upstream candidate.
-    next_local_557 = "0.1.1~dev.557+gcccccccccccc"
-    ordered = [deployed_555, evaluation, next_local_557]
+    next_local_559 = "0.1.1~dev.559+gcccccccccccc"
+    ordered = [deployed_557, evaluation, next_local_559]
 
     def key(version: str) -> tuple[int, str]:
         match = re.fullmatch(
