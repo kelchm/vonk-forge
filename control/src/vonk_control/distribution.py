@@ -236,29 +236,25 @@ class ControllerRuntimeImageVerifiedObjectSource(RecipeBuildVerifiedObjectSource
                 expected_registry = f"sha256:{raw_registry}" if raw_registry is not None else None
                 if expected_registry != receipt.registry_manifest_digest:
                     return False
-                durable = session.scalar(
-                    select(RuntimeImageReceipt).where(
-                        RuntimeImageReceipt.source == "published",
-                        RuntimeImageReceipt.original_content_digest
-                        == receipt.distribution_content_sha256,
-                        RuntimeImageReceipt.state == "verified",
-                        RuntimeImageReceipt.registry_manifest_digest
-                        == receipt.registry_manifest_digest,
-                        RuntimeImageReceipt.platform_manifest_digest == image_digest,
-                        RuntimeImageReceipt.local_image_config_id
-                        == receipt.local_image_config_id,
-                        RuntimeImageReceipt.oci_archive_sha256 == archive_sha256,
-                        RuntimeImageReceipt.image_bytes == receipt.image_bytes,
-                        RuntimeImageReceipt.architecture == receipt.architecture,
-                        RuntimeImageReceipt.runtime_interface == receipt.runtime_interface,
-                        RuntimeImageReceipt.runtime_interface_label
-                        == receipt.runtime_interface_label,
-                    )
-                )
-                if durable is None:
-                    return False
-                authorization_query = select(RuntimeImageAuthorization).where(
-                    RuntimeImageAuthorization.receipt_id == durable.id,
+                authorization_query = select(RuntimeImageAuthorization).join(
+                    RuntimeImageReceipt,
+                    RuntimeImageReceipt.id == RuntimeImageAuthorization.receipt_id,
+                ).where(
+                    RuntimeImageReceipt.source == "published",
+                    RuntimeImageReceipt.original_content_digest
+                    == receipt.distribution_content_sha256,
+                    RuntimeImageReceipt.state == "verified",
+                    RuntimeImageReceipt.registry_manifest_digest
+                    == receipt.registry_manifest_digest,
+                    RuntimeImageReceipt.platform_manifest_digest == image_digest,
+                    RuntimeImageReceipt.local_image_config_id
+                    == receipt.local_image_config_id,
+                    RuntimeImageReceipt.oci_archive_sha256 == archive_sha256,
+                    RuntimeImageReceipt.image_bytes == receipt.image_bytes,
+                    RuntimeImageReceipt.architecture == receipt.architecture,
+                    RuntimeImageReceipt.runtime_interface == receipt.runtime_interface,
+                    RuntimeImageReceipt.runtime_interface_label
+                    == receipt.runtime_interface_label,
                     RuntimeImageAuthorization.source == "published",
                     RuntimeImageAuthorization.state == "authorized",
                 )

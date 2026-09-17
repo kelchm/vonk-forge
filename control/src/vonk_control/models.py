@@ -1483,7 +1483,8 @@ class RuntimeImageAuthorization(Base):
         UniqueConstraint(
             "recipe_revision_id",
             "receipt_id",
-            name="uq_runtime_image_authorization_revision_receipt",
+            "effective_execution_key",
+            name="uq_runtime_image_authorization_revision_receipt_execution",
         ),
         CheckConstraint(
             _lower_hex("original_content_digest", 64),

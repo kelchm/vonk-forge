@@ -507,6 +507,68 @@ def test_same_immutable_image_reuses_preparation_across_recipe_revisions(tmp_pat
     assert transport.calls == 1
 
 
+def test_reserve_revision_availability_reuses_build_and_authorizes_current_key(
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import select
+    from vonk_control.catalog_revision_contract import read_catalog_document
+    from vonk_control.models import RecipeBuild, RuntimeImageAuthorization
+    from vonk_control.models import RuntimeImageReceipt as ReceiptRow
+    from vonk_control.runtime_image_preparation import (
+        resolve_persisted_runtime_image_receipt,
+    )
+
+    from .test_runtime_image_reauthorization import CURRENT_REVISION_ID, scenario
+
+    sessions, now, receipt, receipt_id = scenario(tmp_path)
+    with sessions() as session:
+        original = session.get(ReceiptRow, receipt_id)
+        current = session.get(CatalogDocumentRevision, CURRENT_REVISION_ID)
+        recipe = read_catalog_document(current)
+        revision_id, current_digest, current_key = current.id, current.content_digest, current.execution_key
+        build = session.get(RecipeBuild, receipt.build_id)
+        build_input = build.build_input_sha256
+        old_key, original_owner = original.effective_execution_key, original.recipe_revision_id
+
+    def no_build(*_: object, **__: object) -> dict[str, object]:
+        raise AssertionError("unchanged executable must not dispatch another build")
+
+    service = RecipeImageAvailabilityService(
+        sessions,
+        storage=FilesystemRuntimeImageStorage(tmp_path / "images"),
+        authority=lambda _revision_id, *, force=False: (
+            recipe, _runtime() | {"build_input_sha256": build_input},
+        ),
+        transport=Transport(),
+        builder=no_build,
+        clock=lambda: now,
+        automatic_attempt_limit=1,
+    )
+    with pytest.raises(RecipeImageAvailabilityError, match="execution identity changed"):
+        service.start(revision_id, actor="operator", request_id="wrong-key",
+                      effective_execution_key=old_key)
+    queued = service.start(revision_id, actor="operator", request_id="new-reserve")
+    assert service.run_pending() == 1
+    completed = service.get(queued.id)
+    assert completed.state == "succeeded", completed.failure
+    assert completed.result["build_id"] == receipt.build_id
+    assert completed.result["oci_archive_sha256"] == receipt.oci_archive_sha256
+    with sessions() as session:
+        original = session.get(ReceiptRow, receipt_id)
+        assert original.effective_execution_key == old_key
+        assert original.recipe_revision_id == original_owner
+        assert session.query(ReceiptRow).count() == 1
+        assert session.query(RecipeBuild).count() == 1
+        authorization = session.scalar(select(RuntimeImageAuthorization).where(
+            RuntimeImageAuthorization.recipe_revision_id == revision_id,
+        ))
+        assert authorization.effective_execution_key == current_key
+        assert resolve_persisted_runtime_image_receipt(
+            session, recipe_revision_id=revision_id, current_content_digest=current_digest,
+            effective_execution_key=current_key, receipt=receipt,
+        ).id == receipt_id
+
+
 def test_request_replay_returns_original_before_metadata_refresh(tmp_path: Path) -> None:
     recipe = _recipe("recipe-image.json")
     engine = create_engine("sqlite:///:memory:")

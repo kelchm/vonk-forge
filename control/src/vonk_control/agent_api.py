@@ -124,7 +124,10 @@ from .recipe_execution_contract import (
 from .recipe_operations import (
     prepare_exact_recipe_run_observation_nodes,
 )
-from .runtime_image_preparation import IMAGE_CACHE_DIRECTORY
+from .runtime_image_preparation import (
+    IMAGE_CACHE_DIRECTORY,
+    runtime_image_build_authorized,
+)
 from .source_bundles import SourceBundleError, SourceBundleStore
 from .strict_json import ControllerAPIRoute, StrictJSONModel
 from .telemetry import (
@@ -199,8 +202,6 @@ def _runtime_image_receipt_matches(
     if (
         getattr(receipt, "state", None) != "verified"
         or identity.get("recipe_revision_sha256") != revision_digest
-        or getattr(receipt, "effective_execution_key", None)
-        != identity.get("execution_sha256")
         or runtime_image.get("image_digest") != installation_image_digest
         or runtime_image.get("image_digest")
         != getattr(receipt, "platform_manifest_digest", None)
@@ -224,7 +225,8 @@ def _runtime_image_receipt_matches(
         return False
     if authorization is None:
         if (
-            getattr(receipt, "recipe_revision_id", None) != revision_id
+            getattr(receipt, "effective_execution_key", None) != identity.get("execution_sha256")
+            or getattr(receipt, "recipe_revision_id", None) != revision_id
             or getattr(receipt, "original_content_digest", None) != revision_digest
         ):
             return False
@@ -234,7 +236,7 @@ def _runtime_image_receipt_matches(
         or getattr(authorization, "original_content_digest", None)
         != getattr(receipt, "original_content_digest", None)
         or getattr(authorization, "effective_execution_key", None)
-        != getattr(receipt, "effective_execution_key", None)
+        != identity.get("execution_sha256")
         or getattr(authorization, "source", None) != getattr(receipt, "source", None)
         or getattr(authorization, "platform_manifest_digest", None)
         != getattr(receipt, "platform_manifest_digest", None)
@@ -2054,8 +2056,12 @@ def install_agent_routes(
             )
             build_id = build.id if build is not None else None
             build_state = build.state if build is not None else None
-            build_recipe_revision_id = (
-                build.recipe_revision_id if build is not None else None
+            build_revision_authorized = build is not None and (
+                build.recipe_revision_id == revision.id
+                or runtime_image_build_authorized(
+                    session, recipe_revision_id=revision.id, build=build,
+                    effective_execution_key=effective_execution_key,
+                )
             )
             build_image_digest = build.image_digest if build is not None else None
             build_oci_layout_sha256 = (
@@ -2125,7 +2131,7 @@ def install_agent_routes(
                 build_id != getattr(receipt, "build_id", None)
                 or build_id != installation_recipe_build_id
                 or build_state != "succeeded"
-                or build_recipe_revision_id != revision_id
+                or not build_revision_authorized
                 or build_image_digest != installation_image_digest
                 or build_oci_layout_sha256
                 != getattr(receipt, "oci_archive_sha256", None)

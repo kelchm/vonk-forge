@@ -846,6 +846,27 @@ def test_notes_revision_reuses_original_receipt_with_separate_authorization(
                 verified_at=now,
             )
 
+        # The first historical rank receipt has no live current authorization,
+        # but the second one does. Distribution must join authority to evidence
+        # instead of choosing the first same-byte receipt before looking it up.
+        session.commit()
+        from sqlalchemy.orm import sessionmaker
+        from vonk_control.distribution import ControllerRuntimeImageVerifiedObjectSource
+
+        source = ControllerRuntimeImageVerifiedObjectSource(sessionmaker(engine), tmp_path / "objects")
+        assert source._published_receipt_authorizes(
+            receipt.image_digest, receipt.oci_archive_sha256, recipe_revision_id=new_id
+        )
+        remaining = session.scalar(select(RuntimeImageAuthorization).where(
+            RuntimeImageAuthorization.recipe_revision_id == new_id,
+            RuntimeImageAuthorization.effective_execution_key == "c" * 64,
+        ))
+        remaining.state = "revoked"
+        session.commit()
+        assert not source._published_receipt_authorizes(
+            receipt.image_digest, receipt.oci_archive_sha256, recipe_revision_id=new_id
+        )
+
 
 def test_runtime_image_authority_fails_closed_for_missing_or_revoked_bindings(
     tmp_path: Path,

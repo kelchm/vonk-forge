@@ -637,8 +637,9 @@ def test_start_claim_binds_live_rank_placement_without_reintroducing_authority()
     assert validate_compiled_launch_payload(started)["schema_version"] == 2
 
 
+@pytest.mark.parametrize("source_build", [False, True])
 def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
-    tmp_path: Path,
+    tmp_path: Path, source_build: bool,
 ) -> None:
     node_id = "spk_" + "a" * 32
     serial = "serial-a"
@@ -650,6 +651,9 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
     )
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
+    if source_build:
+        from .test_runtime_image_reauthorization import CURRENT_REVISION_ID, scenario
+        sessions, now, built_receipt, receipt_id = scenario(tmp_path)
     presence = AgentPresenceService(
         sessions,
         ManagementAddressPolicy.parse("10.0.0.0/24"),
@@ -676,8 +680,30 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
     revised = RecipeDefinition.model_validate(revised_data)
     original_digest = content_sha256(original)
     current_digest = content_sha256(revised)
+    if source_build:
+        with sessions() as session:
+            current_revision = session.get(CatalogDocumentRevision, CURRENT_REVISION_ID)
+            original_row = session.get(RuntimeImageReceipt, receipt_id)
+            original_revision_id = original_row.recipe_revision_id
+            revision_id = current_revision.id
+            original_digest = original_row.original_content_digest
+            current_digest = current_revision.content_digest
     spec = _spec(recipe_digest=current_digest)
-    payload = _compile(spec).to_compiled_launch_payload(
+    selected_image = None
+    if source_build:
+        selected_image = _image(source="controller-build", build_id=built_receipt.build_id)
+        selected_image.update(
+            image_digest=built_receipt.image_digest,
+            platform_manifest_digest=built_receipt.platform_manifest_digest,
+            local_image_config_id=built_receipt.local_image_config_id,
+            oci_layout_sha256=built_receipt.oci_archive_sha256,
+            image_bytes=built_receipt.image_bytes,
+            distribution_object={"name": "image.oci.tar", "sha256": built_receipt.oci_archive_sha256,
+                                 "bytes": built_receipt.image_bytes, "kind": "oci-archive"},
+        )
+        spec["runtime"]["image"] = "localhost/vonk/recipe-build@" + built_receipt.image_digest
+        spec["identity"]["execution_sha256"] = execution_identity_sha256(spec)
+    payload = _compile(spec, image=selected_image).to_compiled_launch_payload(
         spec,
         placement={
             "endpoint_address": None,
@@ -692,11 +718,13 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
         },
     )
     installation_id = str(uuid4())
-    revision_id = str(uuid4())
-    original_revision_id = str(uuid4())
+    if not source_build:
+        revision_id = str(uuid4())
+        original_revision_id = str(uuid4())
     document_id = str(uuid4())
     mapping_id = str(uuid4())
-    receipt_id = str(uuid4())
+    if not source_build:
+        receipt_id = str(uuid4())
     effective_execution_key = payload["identity"]["execution_sha256"]
     runtime_image = payload["runtime_image"]
     with sessions.begin() as session:
@@ -712,56 +740,57 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
                 generation=1,
             )
         )
-        session.add(
-            CatalogDocument(
-                id=document_id,
-                kind="recipe",
-                publisher=original.identity.publisher,
-                slug=original.identity.slug,
-                title=original.metadata.title,
-                created_by="test",
-                created_at=now,
-                updated_at=now,
-            )
-        )
-        session.add_all(
-            [
-                CatalogDocumentRevision(
-                    id=original_revision_id,
-                    document_id=document_id,
+        if not source_build:
+            session.add(
+                CatalogDocument(
+                    id=document_id,
                     kind="recipe",
                     publisher=original.identity.publisher,
                     slug=original.identity.slug,
-                    revision_number=1,
-                    schema_version=2,
-                    state="active",
-                    document=original.model_dump(mode="json"),
-                    content_digest=original_digest,
-                    artifact_key="b" * 64,
-                    execution_key="c" * 64,
-                    projected={"source_bundle_sha256": "d" * 64},
+                    title=original.metadata.title,
                     created_by="test",
                     created_at=now,
-                ),
-                CatalogDocumentRevision(
-                    id=revision_id,
-                    document_id=document_id,
-                    kind="recipe",
-                    publisher=revised.identity.publisher,
-                    slug=revised.identity.slug,
-                    revision_number=2,
-                    schema_version=2,
-                    state="active",
-                    document=revised.model_dump(mode="json"),
-                    content_digest=current_digest,
-                    artifact_key="b" * 64,
-                    execution_key="c" * 64,
-                    projected={"source_bundle_sha256": "d" * 64},
-                    created_by="test",
-                    created_at=now,
-                ),
-            ]
-        )
+                    updated_at=now,
+                )
+            )
+            session.add_all(
+                [
+                    CatalogDocumentRevision(
+                        id=original_revision_id,
+                        document_id=document_id,
+                        kind="recipe",
+                        publisher=original.identity.publisher,
+                        slug=original.identity.slug,
+                        revision_number=1,
+                        schema_version=2,
+                        state="active",
+                        document=original.model_dump(mode="json"),
+                        content_digest=original_digest,
+                        artifact_key="b" * 64,
+                        execution_key="c" * 64,
+                        projected={"source_bundle_sha256": "d" * 64},
+                        created_by="test",
+                        created_at=now,
+                    ),
+                    CatalogDocumentRevision(
+                        id=revision_id,
+                        document_id=document_id,
+                        kind="recipe",
+                        publisher=revised.identity.publisher,
+                        slug=revised.identity.slug,
+                        revision_number=2,
+                        schema_version=2,
+                        state="active",
+                        document=revised.model_dump(mode="json"),
+                        content_digest=current_digest,
+                        artifact_key="b" * 64,
+                        execution_key="c" * 64,
+                        projected={"source_bundle_sha256": "d" * 64},
+                        created_by="test",
+                        created_at=now,
+                    ),
+                ]
+            )
         session.add(
             ClusterMapping(
                 id=mapping_id,
@@ -788,50 +817,59 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
                 created_at=now,
             )
         )
-        session.add(
-            RuntimeImageReceipt(
-                id=receipt_id,
-                recipe_revision_id=original_revision_id,
-                source="published",
-                original_content_digest=original_digest,
-                effective_execution_key=effective_execution_key,
-                registry_manifest_digest=runtime_image["registry_manifest_digest"],
-                platform_manifest_digest=runtime_image["platform_manifest_digest"],
-                local_image_config_id=runtime_image["local_image_config_id"],
-                oci_archive_sha256=runtime_image["oci_layout_sha256"],
-                image_bytes=runtime_image["image_bytes"],
-                architecture=runtime_image["architecture"],
-                runtime_interface=runtime_image["runtime_interface"],
-                runtime_interface_label=runtime_image["runtime_interface_label"],
-                build_id=None,
-                verified_at=now,
-                state="verified",
+        if source_build:
+            from vonk_control.runtime_image_preparation import (
+                persist_runtime_image_receipt,
             )
-        )
-        session.add(
-            RuntimeImageAuthorization(
-                recipe_revision_id=revision_id,
-                receipt_id=receipt_id,
-                source="published",
-                original_content_digest=original_digest,
-                effective_execution_key=effective_execution_key,
-                registry_manifest_digest=runtime_image["registry_manifest_digest"],
-                platform_manifest_digest=runtime_image["platform_manifest_digest"],
-                local_image_config_id=runtime_image["local_image_config_id"],
-                oci_archive_sha256=runtime_image["oci_layout_sha256"],
-                image_bytes=runtime_image["image_bytes"],
-                build_id=None,
-                authorized_at=now,
-                state="authorized",
+            persist_runtime_image_receipt(
+                session, recipe_revision_id=revision_id, original_content_digest=current_digest,
+                effective_execution_key=effective_execution_key, receipt=built_receipt, verified_at=now,
             )
-        )
+        else:
+            session.add(
+                RuntimeImageReceipt(
+                    id=receipt_id,
+                    recipe_revision_id=original_revision_id,
+                    source="published",
+                    original_content_digest=original_digest,
+                    effective_execution_key=effective_execution_key,
+                    registry_manifest_digest=runtime_image["registry_manifest_digest"],
+                    platform_manifest_digest=runtime_image["platform_manifest_digest"],
+                    local_image_config_id=runtime_image["local_image_config_id"],
+                    oci_archive_sha256=runtime_image["oci_layout_sha256"],
+                    image_bytes=runtime_image["image_bytes"],
+                    architecture=runtime_image["architecture"],
+                    runtime_interface=runtime_image["runtime_interface"],
+                    runtime_interface_label=runtime_image["runtime_interface_label"],
+                    build_id=None,
+                    verified_at=now,
+                    state="verified",
+                )
+            )
+            session.add(
+                RuntimeImageAuthorization(
+                    recipe_revision_id=revision_id,
+                    receipt_id=receipt_id,
+                    source="published",
+                    original_content_digest=original_digest,
+                    effective_execution_key=effective_execution_key,
+                    registry_manifest_digest=runtime_image["registry_manifest_digest"],
+                    platform_manifest_digest=runtime_image["platform_manifest_digest"],
+                    local_image_config_id=runtime_image["local_image_config_id"],
+                    oci_archive_sha256=runtime_image["oci_layout_sha256"],
+                    image_bytes=runtime_image["image_bytes"],
+                    build_id=None,
+                    authorized_at=now,
+                    state="authorized",
+                )
+            )
         session.add(
             RecipeInstallation(
                 id=installation_id,
                 recipe_revision_id=revision_id,
                 mapping_id=mapping_id,
                 mapping_generation=1,
-                recipe_build_id=None,
+                recipe_build_id=built_receipt.build_id if source_build else None,
                 image_digest=payload["runtime_image"]["image_digest"],
                 plan_digest="a" * 64,
                 plan=installation_plan_document(
@@ -839,7 +877,7 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
                         "schema_version": 1,
                         "mapping_id": mapping_id,
                         "mapping_generation": 1,
-                        "recipe_build_id": None,
+                        "recipe_build_id": built_receipt.build_id if source_build else None,
                         "image_digest": payload["runtime_image"]["image_digest"],
                         "recipe_revision_id": revision_id,
                         "recipe_content_sha256": current_digest,
@@ -919,6 +957,29 @@ def test_production_agent_spec_route_returns_the_persisted_schema_two_plan(
     assert response.status_code == 200
     assert response.json() == payload
     assert response.json()["schema_version"] == 2
+    if source_build:
+        from sqlalchemy import select
+        with sessions.begin() as session:
+            authorization = session.scalar(select(RuntimeImageAuthorization).where(
+                RuntimeImageAuthorization.recipe_revision_id == revision_id,
+                RuntimeImageAuthorization.effective_execution_key == effective_execution_key,
+            ))
+            original_key = authorization.effective_execution_key
+            authorization.effective_execution_key = "9" * 64
+        with TestClient(app) as client:
+            wrong_key = client.get(
+                f"/agent/v1/recipe-installations/{installation_id}/spec", headers=headers,
+            )
+        assert wrong_key.status_code == 409
+        with sessions.begin() as session:
+            authorization = session.get(RuntimeImageAuthorization, authorization.id)
+            authorization.effective_execution_key = original_key
+            authorization.state = "revoked"
+        with TestClient(app) as client:
+            denied = client.get(
+                f"/agent/v1/recipe-installations/{installation_id}/spec", headers=headers,
+            )
+        assert denied.status_code == 409
 
 
 def test_controller_service_binds_canonical_model_cache_and_build_receipts() -> None:

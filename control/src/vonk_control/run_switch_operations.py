@@ -121,6 +121,9 @@ from .run_switch_contract import (
 from .runtime_image_preparation import (
     RuntimeImageReceipt as RuntimeImageReceiptDocument,
 )
+from .runtime_image_preparation import (
+    runtime_image_build_authorized,
+)
 
 
 class RunSwitchOperationConflict(RuntimeError):
@@ -909,7 +912,12 @@ class RecipeLifecyclePhaseExecutor:
             )
         with self._sessions() as session:
             build = session.get(RecipeBuild, build_id)
-            if build is None or build.recipe_revision_id != revision_id:
+            if build is None or (
+                build.recipe_revision_id != revision_id
+                and not runtime_image_build_authorized(
+                    session, recipe_revision_id=revision_id, build=build
+                )
+            ):
                 raise RunSwitchOperationConflict(
                     "run-switch.container-build-receipt-unavailable"
                 )
@@ -2388,7 +2396,7 @@ class RunSwitchOperationService:
         installation: RecipeInstallation | None,
     ) -> RecipeBuild | None:
         revision = session.get(CatalogDocumentRevision, revision_id)
-        if revision is not None and not _is_source_build(revision.document):
+        if revision is None or not _is_source_build(revision.document):
             return None
         if installation is not None:
             build = (
@@ -2404,7 +2412,7 @@ class RunSwitchOperationService:
                 and build.image_bytes is not None
             ):
                 return build
-        # A notes-only source-build revision may have a succeeded build whose
+        # A current source-build revision may have a succeeded build whose
         # original receipt belongs to an older revision.  Only reuse it when
         # the current revision has an explicit authorization binding; this
         # keeps execution/image changes from selecting a coincident build.
@@ -2413,6 +2421,7 @@ class RunSwitchOperationService:
             .where(
                 RuntimeImageAuthorization.recipe_revision_id == revision_id,
                 RuntimeImageAuthorization.source == "controller-build",
+                RuntimeImageAuthorization.effective_execution_key == revision.execution_key,
                 RuntimeImageAuthorization.state == "authorized",
                 RuntimeImageAuthorization.build_id.is_not(None),
             )
@@ -2426,6 +2435,9 @@ class RunSwitchOperationService:
                 and build.state == "succeeded"
                 and build.image_digest is not None
                 and build.image_bytes is not None
+                and runtime_image_build_authorized(
+                    session, recipe_revision_id=revision_id, build=build
+                )
             ):
                 return build
         return session.scalar(
@@ -2543,7 +2555,12 @@ class RunSwitchOperationService:
                 errors.append(f"{node.node_id}: build preview returned no build identity")
                 continue
             selected = session.get(RecipeBuild, proposed_id)
-            if selected is None or selected.recipe_revision_id != revision.id:
+            if selected is None or (
+                selected.recipe_revision_id != revision.id
+                and not runtime_image_build_authorized(
+                    session, recipe_revision_id=revision.id, build=selected
+                )
+            ):
                 errors.append(f"{node.node_id}: build preview receipt is unavailable")
                 continue
             return _BuildSelection(
@@ -4821,7 +4838,12 @@ def _build_receipt_in_session(
     build = session.get(RecipeBuild, build_id)
     if (
         build is None
-        or build.recipe_revision_id != plan.recipe_revision_id
+        or (
+            build.recipe_revision_id != plan.recipe_revision_id
+            and not runtime_image_build_authorized(
+                session, recipe_revision_id=plan.recipe_revision_id, build=build
+            )
+        )
         or build.state != "succeeded"
         or build.build_input_sha256 != plan.build.build_input_sha256
         or not _is_oci_digest(build.image_digest)

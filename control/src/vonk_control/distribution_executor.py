@@ -749,8 +749,6 @@ class DurableDistributionPhaseExecutor:
                             RuntimeImageReceipt.build_id == authorization.build_id,
                             RuntimeImageReceipt.original_content_digest
                             == authorization.original_content_digest,
-                            RuntimeImageReceipt.effective_execution_key
-                            == authorization.effective_execution_key,
                             RuntimeImageReceipt.platform_manifest_digest
                             == authorization.platform_manifest_digest,
                             RuntimeImageReceipt.local_image_config_id
@@ -786,8 +784,6 @@ class DurableDistributionPhaseExecutor:
                                 RuntimeImageReceipt.build_id.is_(None),
                                 RuntimeImageReceipt.original_content_digest
                                 == authorization.original_content_digest,
-                                RuntimeImageReceipt.effective_execution_key
-                                == authorization.effective_execution_key,
                                 RuntimeImageReceipt.registry_manifest_digest
                                 == authorization.registry_manifest_digest,
                                 RuntimeImageReceipt.platform_manifest_digest
