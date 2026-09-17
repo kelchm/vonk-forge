@@ -2,11 +2,11 @@ name: Local evaluation Controller images and setup programs
 
 on:
   push:
-    branches: [patch/evaluation-runtime-argument-budget]
+    branches: [patch/evaluation-image-reauthorization]
   workflow_dispatch:
     inputs:
       evaluation_branch:
-        description: Exact evaluation branch (patch/evaluation-runtime-argument-budget)
+        description: Exact evaluation branch (patch/evaluation-image-reauthorization)
         required: true
         type: string
       source_sha:
@@ -18,16 +18,16 @@ permissions:
   contents: read
 
 env:
-  EVALUATION_BRANCH: patch/evaluation-runtime-argument-budget
+  EVALUATION_BRANCH: patch/evaluation-image-reauthorization
 
 jobs:
   setups:
     # `uses: ./` resolves the reusable workflow and its checkout at this exact
     # caller commit, so the setup programs are built from the selected source.
-    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-runtime-argument-budget'
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-image-reauthorization'
     uses: ./.github/workflows/installer-setups.yml
   images:
-    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-runtime-argument-budget'
+    if: github.repository == 'kelchm/vonk-forge' && startsWith(github.ref, 'refs/heads/patch/evaluation-') && github.ref == 'refs/heads/patch/evaluation-image-reauthorization'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:

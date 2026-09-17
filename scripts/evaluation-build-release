@@ -20,10 +20,10 @@ SEMVER_RE = re.compile(rf"^{SEMVER}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 ARCHITECTURE = "linux-arm64"
-# Explicit local evaluation sequence: 556 follows deployed48fc dev.555.
+# Explicit local evaluation sequence: 557 follows deployed f3f3ce30 dev.556.
 # This frozen-base backport does not claim to supersede newer upstream packages;
 # the semantic Cargo version and exact fork source remain authoritative.
-EVALUATION_SEQUENCE = 556
+EVALUATION_SEQUENCE = 557
 EVALUATION_REPOSITORY = "https://github.com/kelchm/vonk-forge"
 EVALUATION_GITHUB_REPOSITORY = "kelchm/vonk-forge"
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
