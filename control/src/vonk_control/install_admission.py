@@ -40,6 +40,7 @@ from .recipe_runtime_specs import (
     recipe_topology,
     resolve_recipe_entities,
 )
+from .runtime_image_preparation import runtime_image_build_authorized
 from .runtime_preflight import (
     admission_blockers,
     latest_result,
@@ -179,7 +180,12 @@ class InstallAdmissionService:
                     or canonical_build_revision is None
                     or canonical_build_revision.kind != "recipe"
                     or canonical_build_revision.state != "active"
-                    or canonical_build_revision.content_digest != revision.content_digest
+                    or (
+                        canonical_build_revision.content_digest != revision.content_digest
+                        and not runtime_image_build_authorized(
+                            session, recipe_revision_id=revision.id, build=build
+                        )
+                    )
                 ):
                     raise ValueError("successful recipe build does not match the mapping")
             elif build is not None:

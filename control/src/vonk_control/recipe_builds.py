@@ -1010,6 +1010,8 @@ class RecipeBuildService:
     def plan_distribution(
         self, build_id: str, mapping_id: str, *, generation: int
     ) -> ImageDistributionPlan:
+        from .runtime_image_preparation import runtime_image_build_authorized
+
         with self._sessions() as session:
             build = session.get(RecipeBuild, build_id)
             mapping = session.get(ClusterMapping, mapping_id)
@@ -1029,7 +1031,12 @@ class RecipeBuildService:
             if (
                 mapping.state != "ready"
                 or mapping.generation != generation
-                or mapping.recipe_revision_id != build.recipe_revision_id
+                or (
+                    mapping.recipe_revision_id != build.recipe_revision_id
+                    and not runtime_image_build_authorized(
+                        session, recipe_revision_id=mapping.recipe_revision_id, build=build
+                    )
+                )
             ):
                 raise RecipeBuildError(
                     "build.mapping_mismatch",

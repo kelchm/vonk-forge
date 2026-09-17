@@ -298,3 +298,61 @@ def test_reauthorization_preserves_non_ascii_build_identity(tmp_path):
             current_content_digest=revision.content_digest,
             effective_execution_key=revision.execution_key, receipt=receipt,
         ).id == original_row_id
+
+
+@pytest.mark.parametrize("invalid", [None, "missing", "revoked", "generation", "build-input", "receipt"])
+def test_source_image_distribution_requires_current_authority(tmp_path, invalid):
+    from vonk_control.models import ClusterMapping, ClusterMappingNode
+    from vonk_control.recipe_builds import RecipeBuildError
+    from vonk_control.source_bundles import SourceBundleStore
+
+    sessions, now, receipt, original_row_id = scenario(tmp_path)
+    with sessions.begin() as session:
+        revision = session.get(CatalogDocumentRevision, CURRENT_REVISION_ID)
+        build = session.get(RecipeBuild, receipt.build_id)
+        original_owner = build.recipe_revision_id
+        if invalid != "missing":
+            persist_runtime_image_receipt(
+                session, recipe_revision_id=revision.id,
+                original_content_digest=revision.content_digest,
+                effective_execution_key=revision.execution_key,
+                receipt=receipt, verified_at=now,
+            )
+        mapping = ClusterMapping(
+            recipe_revision_id=revision.id, topology_name="synthetic-test",
+            generation=1, node_count=1, state="ready", parameters={},
+            placement_digest="d" * 64, endpoint_owner_node_id=build.builder_node_id,
+            created_by="admin", created_at=now, updated_at=now,
+        )
+        session.add(mapping)
+        session.flush()
+        session.add(ClusterMappingNode(
+            mapping_id=mapping.id, node_id=build.builder_node_id, rank=0,
+            role="entrypoint", endpoint_owner=True, created_at=now,
+        ))
+        mapping_id = mapping.id
+        if invalid == "revoked":
+            auth = session.scalar(select(RuntimeImageAuthorization).where(
+                RuntimeImageAuthorization.recipe_revision_id == revision.id,
+            ))
+            auth.state = "revoked"
+        elif invalid == "build-input":
+            build.build_input_sha256 = "9" * 64
+        elif invalid == "receipt":
+            session.get(ReceiptRow, original_row_id).state = "revoked"
+    service = RecipeBuildService(sessions, bundles=SourceBundleStore(tmp_path / "bundles"))
+    if invalid:
+        with pytest.raises(RecipeBuildError, match="mapping generation does not match"):
+            service.plan_distribution(receipt.build_id, mapping_id,
+                                      generation=2 if invalid == "generation" else 1)
+    else:
+        plan = service.plan_distribution(receipt.build_id, mapping_id, generation=1)
+        assert plan.build_id == receipt.build_id
+        assert len(plan.targets) == 1
+        payload = plan.targets[0][1]
+        assert payload["mapping_id"] == mapping_id
+        assert payload["build_id"] == receipt.build_id
+        assert payload["image_digest"] == receipt.platform_manifest_digest
+        assert payload["oci_layout_sha256"] == receipt.oci_archive_sha256
+        with sessions() as session:
+            assert session.get(RecipeBuild, receipt.build_id).recipe_revision_id == original_owner
