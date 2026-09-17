@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 from vonk_control.agent_api import _runtime_image_receipt_matches
+from vonk_control.catalog_entities import CatalogEntityService
 from vonk_control.catalog_revision_contract import read_catalog_document
 from vonk_control.distribution_executor import DurableDistributionPhaseExecutor
 from vonk_control.models import (
@@ -36,8 +37,19 @@ from .test_runtime_image_preparation import (
 CURRENT_REVISION_ID = "11111111-2222-4333-8444-555555555555"
 
 
-def scenario(tmp_path, *, current_recipe_mutation=None):
+def scenario(tmp_path, *, current_recipe_mutation=None, build_label=None):
     sessions, bundles, now, node_id, original = setup(tmp_path)
+    if build_label is not None:
+        catalog = CatalogEntityService(sessions, clock=lambda: now)
+        raw = copy.deepcopy(original.document)
+        raw["settings"]["knobs"] = {
+            "label": {"value": build_label, "change_effect": "rebuild"},
+        }
+        draft = catalog.revise(original.document_id, raw, actor="admin")
+        with sessions.begin() as session:
+            stored = session.get(CatalogDocumentRevision, draft.id)
+            stored.projected = copy.deepcopy(original.projected)
+        original = catalog.resolve(draft.id, actor="admin")
     service = RecipeBuildService(sessions, bundles=bundles)
     plan = service.plan(original.id, node_id, now=now)
     storage = FilesystemRuntimeImageStorage(tmp_path / "images")
@@ -71,7 +83,7 @@ def scenario(tmp_path, *, current_recipe_mutation=None):
         new_recipe = RecipeDefinition.model_validate(raw)
         new = CatalogDocumentRevision(
             id=CURRENT_REVISION_ID, document_id=old.document_id, kind=old.kind,
-            publisher=old.publisher, slug=old.slug, revision_number=2, schema_version=2,
+            publisher=old.publisher, slug=old.slug, revision_number=old.revision_number + 1, schema_version=2,
             state="active", document=new_recipe.model_dump(mode="json"),
             content_digest=content_sha256(new_recipe), artifact_key=old.artifact_key,
             execution_key="2" * 64, projected=copy.deepcopy(old.projected),
@@ -268,3 +280,21 @@ def test_run_switch_build_consumers_require_current_catalog_authority(tmp_path):
             _build_receipt_in_session(session, plan)
     with pytest.raises(RunSwitchOperationConflict, match="receipt-unavailable"):
         executor._execute_container_build(plan, actor="test", request_key="reuse")
+
+
+def test_reauthorization_preserves_non_ascii_build_identity(tmp_path):
+    sessions, now, receipt, original_row_id = scenario(tmp_path, build_label="modèle-模型")
+    with sessions.begin() as session:
+        revision = session.get(CatalogDocumentRevision, CURRENT_REVISION_ID)
+        row = persist_runtime_image_receipt(
+            session, recipe_revision_id=revision.id,
+            original_content_digest=revision.content_digest,
+            effective_execution_key=revision.execution_key,
+            receipt=receipt, verified_at=now,
+        )
+        assert row.id == original_row_id
+        assert resolve_persisted_runtime_image_receipt(
+            session, recipe_revision_id=revision.id,
+            current_content_digest=revision.content_digest,
+            effective_execution_key=revision.execution_key, receipt=receipt,
+        ).id == original_row_id

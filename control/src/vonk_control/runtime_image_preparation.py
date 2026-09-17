@@ -741,6 +741,7 @@ def _validate_build_reauthorization(
     from .recipe_builds import (
         BUILD_ARTIFACT_FORMAT,
         _canonical_build,
+        _digest,
         derive_build_input_identity,
     )
     from .recipe_execution_contract import (
@@ -775,9 +776,7 @@ def _validate_build_reauthorization(
             topology_inputs=projected.build_topology_inputs,
             model_artifacts=projected.build_model_artifacts,
         )
-        digest = hashlib.sha256(json.dumps(
-            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode()).hexdigest()
+        digest = _digest(identity)
         if digest != build.build_input_sha256 or plan.build_input_sha256 != digest:
             raise ValueError("executable build identity changed")
     except (ValueError, TypeError, AttributeError) as error:
