@@ -105,6 +105,7 @@ from vonk_control.route_runtime import (
 from vonk_control.run_admission import RunAdmissionService
 from vonk_control.run_switch_operations import (
     RunSwitchCleanupApplyRequest,
+    RunSwitchOperationConflict,
     RunSwitchOperationService,
 )
 from vonk_control.runtime_adapters import resolve_runtime_adapter
@@ -4268,7 +4269,7 @@ def test_failed_uninstall_resumes_only_unfinished_nodes_after_service_restart(
         None if retain_shared_model else preview.model_impact.model_content_sha256
     }
     with sessions.begin() as session:
-        session.get(Job, retry.id).state = cleanup_state
+        _required(session.get(Job, retry.id)).state = cleanup_state
     assert (
         recovered.start_installation(
             target.owner_id, actor="admin", request_id=install_request
@@ -4287,7 +4288,10 @@ def test_failed_uninstall_resumes_only_unfinished_nodes_after_service_restart(
             request_id=str(uuid.uuid4()),
         )
     with sessions() as session:
-        assert session.get(RecipeInstallation, target.owner_id).state == "failed"
+        assert (
+            _required(session.get(RecipeInstallation, target.owner_id)).state
+            == "failed"
+        )
         assert set(
             session.scalars(
                 select(InstallationNode.state).where(
@@ -4695,10 +4699,12 @@ def test_expired_uninstall_lease_does_not_resolve_waiting_cleanup(
         )
 
 
+@pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("native_succeeded", [False, True])
 def test_run_switch_cleanup_observes_waiting_uninstall_before_resume(
     tmp_path: Path,
     native_succeeded: bool,
+    expired: bool,
 ) -> None:
     from .test_run_switch_operations import (
         CompleteArtifactInspector,
@@ -4717,7 +4723,7 @@ def test_run_switch_cleanup_observes_waiting_uninstall_before_resume(
         request_id=str(uuid.uuid4()),
     )
     _park_waiting_uninstall(sessions, uninstall.id, issue_attempt=True)
-    current = {"now": NOW}
+    current = {"now": NOW + timedelta(hours=1) if expired else NOW}
 
     def clock() -> datetime:
         return current["now"]
@@ -4732,6 +4738,32 @@ def test_run_switch_cleanup_observes_waiting_uninstall_before_resume(
         memory_floor_bytes=50,
     )
     preview = switch.preview_cleanup(installation.owner_id, actor="admin")
+    if expired:
+        assert preview.allowed is False
+        assert "run-switch.uninstall-blocked" in [r.code for r in preview.blockers]
+        with pytest.raises(RunSwitchOperationConflict):
+            switch.apply_cleanup(
+                RunSwitchCleanupApplyRequest(
+                    installation_id=installation.owner_id,
+                    request_key=str(uuid.uuid4()),
+                ),
+                actor="admin",
+            )
+        with sessions() as session:
+            assert (
+                session.query(Job).filter(Job.kind == "recipe.uninstall").count() == 1
+            )
+        operations.record_node_result(
+            uninstall.id,
+            nodes[0],
+            succeeded=native_succeeded,
+            evidence={"removed": True}
+            if native_succeeded
+            else {"code": "cleanup.failed"},
+        )
+        if not native_succeeded:
+            assert switch.preview_cleanup(installation.owner_id, actor="admin").allowed
+        return
     assert preview.allowed is True, [reason.code for reason in preview.blockers]
     assert "run-switch.uninstall-issued-prerequisite" in [
         reason.code for reason in preview.warnings

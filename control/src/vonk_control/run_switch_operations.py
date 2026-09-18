@@ -2097,6 +2097,12 @@ class RunSwitchOperationService:
                     issued = self._lifecycle.assess_superseded_issued(
                         "recipe.uninstall", installation_id
                     )
+                    # An elapsed polling budget cannot establish cleanup. Keep
+                    # admission blocked until the native outcome is observed.
+                    if issued is not None and now >= _aware(
+                        issued.observation_deadline
+                    ):
+                        issued = None
                     for blocker in assessment.blockers:
                         reason = _as_reason(
                             "run-switch.uninstall-issued-prerequisite"
