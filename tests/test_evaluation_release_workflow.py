@@ -229,6 +229,7 @@ def test_evaluation_canary_uses_current_fresh_schema_native_acceptance() -> None
     pin = RECIPE_PIN.read_text()
 
     assert "EVALUATION_BRANCH: patch/evaluation-upgrade-608" in text
+    assert 'test "$source" = "$GITHUB_SHA"' in text
     assert 'python-version: "3.14"' in text
     assert "--python 3.14" in text
     assert "--project control --frozen" in text
@@ -251,4 +252,6 @@ def test_evaluation_installer_public_key_is_the_existing_fork_authority() -> Non
     assert "-----BEGIN PUBLIC KEY-----" in text
     assert "BEGIN RSA PRIVATE KEY" not in text
     assert "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEApgPjzwUmDaSndVYCfRrf" in text
-    assert "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA5fqLfwbKgSGMbioEdyVS" not in text
+    assert (
+        "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA5fqLfwbKgSGMbioEdyVS" not in text
+    )

@@ -16,6 +16,7 @@ from tests.acceptance.evaluation_local_release import (
     EvaluationLocalLifecycle,
     assert_fork_images,
     assert_fork_overlay,
+    assert_nas_payload_images,
     is_evaluation_fork_image,
     native_nas_setup_command,
     native_spark_setup_command,
@@ -125,7 +126,23 @@ def _signed_release(tmp_path: Path) -> argparse.Namespace:
             b"candidate-cli-wheel\n",
         ),
         "nas-payload": _record(
-            objects, f"{prefix}/nas/current/payload.json", b'{"schema_version":2}\n'
+            objects,
+            f"{prefix}/nas/current/payload.json",
+            (
+                json.dumps(
+                    {
+                        "docker_compose_yaml": _overlay_text(
+                            {
+                                role: _fork_image(role)
+                                for role in ("api", "worker", "hermes", "litellm")
+                            }
+                        )
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode(),
         ),
         "nas-setup-linux-arm64": _record(
             objects,
@@ -526,3 +543,51 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
     assert observed["forbidden_values"] == [token]
     assert token not in repr(observed["command"])
     assert token not in repr(observed["environment"])
+
+
+@pytest.mark.parametrize("replacement", ["postgres:latest", "postgres", "postgres:dev"])
+def test_signed_nas_payload_rejects_floating_supporting_images(
+    tmp_path: Path, replacement: str
+) -> None:
+    images = {
+        role: _fork_image(role) for role in ("api", "worker", "hermes", "litellm")
+    }
+    payload = tmp_path / "payload.json"
+    _canonical(
+        payload,
+        {
+            "docker_compose_yaml": _overlay_text(images)
+            + f"  postgres:\n    image: {replacement}\n"
+        },
+    )
+    with pytest.raises(LifecycleError, match="payload image graph"):
+        assert_nas_payload_images(payload, images)
+
+
+def test_signed_nas_payload_rejects_wrong_fork_pin(tmp_path: Path) -> None:
+    images = {
+        role: _fork_image(role) for role in ("api", "worker", "hermes", "litellm")
+    }
+    payload = tmp_path / "payload.json"
+    _canonical(
+        payload,
+        {
+            "docker_compose_yaml": _overlay_text(
+                {**images, "api": _fork_image("api", digest="e" * 64)}
+            )
+        },
+    )
+    with pytest.raises(LifecycleError, match="payload image graph"):
+        assert_nas_payload_images(payload, images)
+
+
+def test_overlay_rejects_extra_service(tmp_path: Path) -> None:
+    images = {
+        role: _fork_image(role) for role in ("api", "worker", "hermes", "litellm")
+    }
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text(
+        _overlay_text(images) + "  unexpected:\n    image: postgres:18.6\n"
+    )
+    with pytest.raises(LifecycleError, match="unexpected keys"):
+        assert_fork_overlay(overlay, images, SOURCE_SHA)

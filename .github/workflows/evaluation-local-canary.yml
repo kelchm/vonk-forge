@@ -87,6 +87,7 @@ jobs:
           source=${BUNDLE_TAG#evaluation/}
           [[ "$source" =~ ^[0-9a-f]{40}$ ]]
           test "$BUNDLE_TAG" = "evaluation/$source"
+          test "$source" = "$GITHUB_SHA"
           echo "VONK_EVALUATION_CANDIDATE_SOURCE=$source" >> "$GITHUB_ENV"
           [[ "$BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
           gh release download "$BUNDLE_TAG" --repo kelchm/vonk-forge \

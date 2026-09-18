@@ -235,8 +235,14 @@ def overlay_service_images(overlay: Path) -> dict[str, str]:
     if not isinstance(services, dict):
         raise LifecycleError("evaluation Compose overlay is invalid")
     images: dict[str, str] = {}
+    if set(document) != {"services"} or set(services) != {
+        name for names in FORK_ROLE_SERVICES.values() for name in names
+    }:
+        raise LifecycleError("evaluation Compose overlay has unexpected keys")
     for name, service in services.items():
-        image = service.get("image") if isinstance(service, dict) else None
+        if not isinstance(service, dict) or set(service) != {"image"}:
+            raise LifecycleError("evaluation Compose overlay has unexpected keys")
+        image = service.get("image")
         if not isinstance(name, str) or not isinstance(image, str):
             raise LifecycleError("evaluation Compose overlay is invalid")
         images[name] = image
@@ -253,6 +259,31 @@ def assert_fork_overlay(
         for name in names:
             if services.get(name) != expected:
                 raise LifecycleError("Compose overlay differs from the fork pin")
+
+
+def assert_nas_payload_images(payload: Path, images: Mapping[str, str]) -> None:
+    document = _read_canonical_document(payload, "signed NAS payload")
+    try:
+        services = yaml.safe_load(document["docker_compose_yaml"])["services"]
+        if not isinstance(services, dict) or not services:
+            raise ValueError("missing services")
+        for service in services.values():
+            image = service["image"]
+            tag = image.split("@", 1)[0].rsplit("/", 1)[-1]
+            if ":" not in tag or tag.rsplit(":", 1)[1] in {
+                "latest",
+                "main",
+                "edge",
+                "stable",
+                "master",
+                "dev",
+            }:
+                raise ValueError("floating image")
+        for role, names in FORK_ROLE_SERVICES.items():
+            if any(services[name]["image"] != images[role] for name in names):
+                raise ValueError("fork image mismatch")
+    except (KeyError, TypeError, AttributeError, ValueError, yaml.YAMLError) as error:
+        raise LifecycleError("signed NAS payload image graph is invalid") from error
 
 
 def native_nas_setup_command(
@@ -491,6 +522,7 @@ def verify_local_signed_release(arguments: argparse.Namespace) -> LocalReleaseAr
             raise LifecycleError(f"{key} digest does not match its release record")
         resolved[key] = path
         digests[key] = digest
+    assert_nas_payload_images(resolved["nas-payload"], images)
     package_signature = resolved["agent-package-signature-linux-arm64"].read_bytes()
     if package_signature != f"{host_signature}\n".encode("ascii"):
         raise LifecycleError(
@@ -805,7 +837,9 @@ class EvaluationLocalLifecycle(SparkLifecycle):
                 )
                 if logs is not None:
                     sections.append(
-                        service + " diagnostics:\n" + self._redact_diagnostics(
+                        service
+                        + " diagnostics:\n"
+                        + self._redact_diagnostics(
                             logs.stdout or logs.stderr, limit=16000
                         )
                     )
