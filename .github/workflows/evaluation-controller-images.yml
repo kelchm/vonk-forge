@@ -46,12 +46,12 @@ jobs:
             dockerfile: control/Dockerfile
             target: worker
           - role: hermes
-            context: ${{ runner.temp }}/image-contexts/hermes
-            dockerfile: ${{ runner.temp }}/image-contexts/hermes/Dockerfile
+            context: image-contexts/hermes
+            dockerfile: image-contexts/hermes/Dockerfile
             target: managed
           - role: litellm
-            context: ${{ runner.temp }}/image-contexts/litellm
-            dockerfile: ${{ runner.temp }}/image-contexts/litellm/deploy/compose/litellm/Dockerfile
+            context: image-contexts/litellm
+            dockerfile: image-contexts/litellm/deploy/compose/litellm/Dockerfile
             target: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,8 +98,8 @@ jobs:
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: ${{ (matrix.role == 'api' || matrix.role == 'worker') && github.workspace || runner.temp }}/${{ matrix.context }}
+          file: ${{ (matrix.role == 'api' || matrix.role == 'worker') && github.workspace || runner.temp }}/${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           build-args: VONK_SOURCE_COMMIT=${{ github.sha }}
           platforms: linux/amd64,linux/arm64
