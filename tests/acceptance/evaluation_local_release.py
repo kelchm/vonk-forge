@@ -266,7 +266,7 @@ def assert_nas_payload_images(payload: Path, images: Mapping[str, str]) -> None:
     try:
         compose_text = document["docker_compose_yaml"]
         if not isinstance(compose_text, str):
-            raise ValueError("Compose text is invalid")
+            raise TypeError("Compose text is invalid")
         services = yaml.safe_load(compose_text)["services"]
         if not isinstance(services, dict) or not services:
             raise ValueError("missing services")
