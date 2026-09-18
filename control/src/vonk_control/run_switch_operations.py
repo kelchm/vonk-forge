@@ -1544,6 +1544,12 @@ class RecipeLifecyclePhaseExecutor:
                 "recipe.uninstall", installation_id, ordinal
             )
             self._observe_older_issued("recipe.uninstall", installation_id, ordinal)
+            # An older issued removal may have completed while this phase
+            # observed it. Use the same durable-state proof as final verify
+            # instead of submitting another uninstall of an absent owner.
+            completed = self._verify_cleanup(plan)
+            if not completed.waiting:
+                return PhaseExecution(result={"installation_id": installation_id})
             try:
                 uninstall_plan = self._lifecycle.preview_uninstall(installation_id)
                 value = self._lifecycle.uninstall(

@@ -305,6 +305,7 @@ _WORKLOAD_INTENT_KINDS = frozenset(
         "recipe.job.run.v1",
     }
 )
+_UNRESOLVED_UNINSTALL_STATES = frozenset({"queued", "running", "waiting-for-operator"})
 
 
 def _bound_workload_intent(job: Job) -> int:
@@ -407,7 +408,50 @@ def _active_owned_workload_jobs(
         job
         for job in session.scalars(statement)
         if job.state != "waiting-for-operator"
+        or kind == "recipe.uninstall"
         or (
+            isinstance(job.result, Mapping)
+            and job.result.get("cancel_requested") is True
+        )
+    )
+
+
+def _unresolved_owned_uninstall(
+    session: Session, installation_id: str, *, lock: bool = False
+) -> Job | None:
+    """Queued, running, or waiting-for-operator uninstall for this owner.
+
+    Terminal cancelled jobs are resolved and must not match. Unissued
+    queued/running replacement stays in ``_active_owned_workload_jobs``.
+    """
+
+    statement = (
+        select(Job)
+        .where(
+            Job.kind == "recipe.uninstall",
+            Job.state.in_(_UNRESOLVED_UNINSTALL_STATES),
+            Job.payload["owner_kind"].as_string() == "installation",
+            Job.payload["owner_id"].as_string() == installation_id,
+        )
+        .order_by(Job.id)
+        .limit(1)
+    )
+    if lock:
+        statement = statement.with_for_update(of=Job)
+    return session.scalar(statement)
+
+
+def _waiting_uninstall_lacks_reconciliation_proof(job: Job) -> bool:
+    """True when a waiting uninstall is fenced but has no observe/cancel proof.
+
+    Direct manual uninstalls can lack an ordinal or attempt receipt. Keep the
+    fence visible instead of raising, and leave explicit cancel available.
+    """
+
+    return (
+        job.kind == "recipe.uninstall"
+        and job.state == "waiting-for-operator"
+        and not (
             isinstance(job.result, Mapping)
             and job.result.get("cancel_requested") is True
         )
@@ -814,6 +858,10 @@ class RecipeOperationService:
             )
             if existing is not None:
                 return existing
+            if _unresolved_owned_uninstall(session, installation_id) is not None:
+                raise RecipeOperationConflict(
+                    "recipe installation has an active uninstall"
+                )
             if installation.state == "installed":
                 completed = session.scalar(
                     select(Job)
@@ -1288,17 +1336,7 @@ class RecipeOperationService:
             )
             if installation_fence is None or installation_fence.state != "installed":
                 raise RecipeOperationConflict("recipe installation is not runnable")
-            active_uninstall = session.scalar(
-                select(Job.id)
-                .where(
-                    Job.kind == "recipe.uninstall",
-                    Job.state.in_({"queued", "running"}),
-                    Job.payload["owner_kind"].as_string() == "installation",
-                    Job.payload["owner_id"].as_string() == plan.installation_id,
-                )
-                .limit(1)
-            )
-            if active_uninstall is not None:
+            if _unresolved_owned_uninstall(session, plan.installation_id) is not None:
                 raise RecipeOperationConflict("recipe installation is not runnable")
             try:
                 run_id = self._run_admission.accept_run_in_session(
@@ -1669,6 +1707,8 @@ class RecipeOperationService:
                 if tuple(sorted(job.targets)) != scope:
                     raise RecipeOperationConflict("workload owner scope changed")
                 if type(ordinal) is not int or ordinal < 1:
+                    if _waiting_uninstall_lacks_reconciliation_proof(job):
+                        continue
                     raise RecipeOperationConflict(
                         "issued workload authority is invalid"
                     )
@@ -1691,6 +1731,8 @@ class RecipeOperationService:
                     or child.workload_intent_ordinal != ordinal
                     for child in children
                 ):
+                    if _waiting_uninstall_lacks_reconciliation_proof(job):
+                        continue
                     raise RecipeOperationConflict(
                         "issued workload children are invalid"
                     )
@@ -1704,6 +1746,8 @@ class RecipeOperationService:
                     )
                 )
                 if not attempts:
+                    if _waiting_uninstall_lacks_reconciliation_proof(job):
+                        continue
                     raise RecipeOperationConflict(
                         "issued workload attempt evidence is missing"
                     )
@@ -1723,6 +1767,8 @@ class RecipeOperationService:
                 )
                 plan_digest = job.payload.get("plan_digest")
                 if not isinstance(plan_digest, str):
+                    if _waiting_uninstall_lacks_reconciliation_proof(job):
+                        continue
                     raise RecipeOperationConflict("issued workload plan is invalid")
                 pending.append(
                     IssuedWorkloadReconciliation(
@@ -2161,6 +2207,8 @@ class RecipeOperationService:
         installation = session.get(RecipeInstallation, owner_id, with_for_update=True)
         if installation is None or installation.state not in {"partial", "failed"}:
             raise RecipeOperationConflict("recipe installation is not retryable")
+        if _unresolved_owned_uninstall(session, owner_id) is not None:
+            raise RecipeOperationConflict("recipe installation has an active uninstall")
         nodes = tuple(
             session.scalars(
                 select(InstallationNode)
@@ -3006,7 +3054,12 @@ class RecipeOperationService:
     def cancel(
         self, operation_id: str, *, actor: str, request_id: str, reason: str
     ) -> RecipeOperationView:
-        """Durably cancel a queued/running recipe operation."""
+        """Durably cancel a queued/running recipe operation.
+
+        Waiting uninstalls accept the same explicit cancel: persist intent, and
+        resolve only after proven-unissued children or a later native receipt.
+        An expired lease is not proof the agent stopped.
+        """
         now = self._clock()
         cancellation_reason = _cancel_reason(reason)
         with self._sessions() as session:
@@ -3099,7 +3152,9 @@ class RecipeOperationService:
                 raise RecipeOperationConflict(
                     "cancellation request key was already used differently"
                 )
-            if job.state not in {"queued", "running"}:
+            if job.state not in {"queued", "running"} and not (
+                job.kind == "recipe.uninstall" and job.state == "waiting-for-operator"
+            ):
                 raise RecipeOperationConflict("recipe operation is not cancellable")
             previous = _validated_result(job.kind, job.result) or {}
             if previous.get("cancel_requested") is True:
@@ -3123,8 +3178,17 @@ class RecipeOperationService:
                 if child.state == "queued" and child.current_attempt == 0:
                     child.state = "cancelled"
                     child.updated_at = now
-            if any(
+            issued_or_uncertain = any(
                 child.state in {"running", "waiting-for-operator"} for child in children
+            )
+            proven_unissued = bool(children) and all(
+                child.state == "cancelled" and child.current_attempt == 0
+                for child in children
+            )
+            if issued_or_uncertain or (
+                job.kind == "recipe.uninstall"
+                and job.state == "waiting-for-operator"
+                and not proven_unissued
             ):
                 job.result = _validated_result(
                     job.kind,
@@ -3779,19 +3843,9 @@ class RecipeOperationService:
             active_statement = active_statement.with_for_update(of=RecipeRun)
         active_runs = tuple(session.scalars(active_statement))
 
-        operation_statement = (
-            select(Job)
-            .where(
-                Job.kind == "recipe.uninstall",
-                Job.state.in_({"queued", "running"}),
-                Job.payload["owner_id"].as_string() == installation_id,
-            )
-            .order_by(Job.id)
-            .limit(1)
+        active_operation = (
+            _unresolved_owned_uninstall(session, installation_id, lock=lock) is not None
         )
-        if lock:
-            operation_statement = operation_statement.with_for_update(of=Job)
-        active_operation = session.scalar(operation_statement) is not None
         if active_operation and not lock:
             active_uninstalls = _active_owned_workload_jobs(
                 session, "recipe.uninstall", installation_id

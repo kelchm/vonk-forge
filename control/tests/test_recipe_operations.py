@@ -103,7 +103,10 @@ from vonk_control.route_runtime import (
     verify_active_route_bundle,
 )
 from vonk_control.run_admission import RunAdmissionService
-from vonk_control.run_switch_operations import RunSwitchOperationService
+from vonk_control.run_switch_operations import (
+    RunSwitchCleanupApplyRequest,
+    RunSwitchOperationService,
+)
 from vonk_control.runtime_adapters import resolve_runtime_adapter
 from vonk_control.runtime_image_preparation import (
     FilesystemRuntimeImageStorage,
@@ -4084,7 +4087,14 @@ def test_uninstall_queue_rollback_and_request_key_are_owner_bound(
 
 @pytest.mark.parametrize(
     ("uninstall_state", "blocked"),
-    (("queued", True), ("running", True), ("failed", False), ("succeeded", False)),
+    (
+        ("queued", True),
+        ("running", True),
+        ("waiting-for-operator", True),
+        ("failed", False),
+        ("succeeded", False),
+        ("cancelled", False),
+    ),
 )
 def test_start_fences_only_active_uninstall_operations_after_installation_lock(
     tmp_path: Path, uninstall_state: str, blocked: bool
@@ -4169,6 +4179,622 @@ def test_different_uninstall_request_remains_blocked_by_active_operation(
         )
     assert [parent.id for parent in parents] == [first.id]
     assert {child.node_id for child in children} == set(nodes)
+
+
+@pytest.mark.parametrize("cleanup_state", ["queued", "waiting-for-operator"])
+@pytest.mark.parametrize("first_node_removed", [False, True])
+@pytest.mark.parametrize("retain_shared_model", [False, True])
+def test_failed_uninstall_resumes_only_unfinished_nodes_after_service_restart(
+    tmp_path: Path,
+    first_node_removed: bool,
+    retain_shared_model: bool,
+    cleanup_state: str,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(
+        tmp_path, nodes=2
+    )
+    install_request = str(uuid.uuid4())
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=install_request
+    )
+    retained = (
+        installed_recipe(
+            service, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+        )
+        if retain_shared_model
+        else None
+    )
+    initial = service.preview_uninstall(target.owner_id)
+    first = service.uninstall(
+        target.owner_id,
+        plan_digest=initial.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    service.record_node_result(
+        first.id,
+        nodes[0],
+        succeeded=first_node_removed,
+        evidence={"removed": True}
+        if first_node_removed
+        else {"code": "cleanup.failed"},
+    )
+    service.record_node_result(
+        first.id, nodes[1], succeeded=False, evidence={"code": "cleanup.failed"}
+    )
+    assert service.get(first.id).state == "failed"
+    recovered = RecipeOperationService(
+        sessions,
+        install_admission=service._install_admission,
+        run_admission=service._run_admission,
+        agent_jobs=RecordingQueue(),
+        clock=lambda: NOW + timedelta(seconds=1),
+    )
+    preview = recovered.preview_uninstall(target.owner_id)
+    assert preview.allowed is True
+    assert preview.bytes_removed is None
+    assert preview.blockers == ()
+    assert [reason.code for reason in preview.warnings] == ["uninstall.bytes_unknown"]
+    assert preview.model_impact.effect == (
+        "recipe-only" if retain_shared_model else "recipe-and-unused-model"
+    )
+    request_id = str(uuid.uuid4())
+    retry = recovered.uninstall(
+        target.owner_id,
+        plan_digest=preview.plan_digest,
+        actor="admin",
+        request_id=request_id,
+    )
+    assert (
+        recovered.uninstall(
+            target.owner_id,
+            plan_digest=preview.plan_digest,
+            actor="admin",
+            request_id=request_id,
+        )
+        == retry
+    )
+    with sessions() as session:
+        children = tuple(
+            session.scalars(
+                select(AgentOperation).where(AgentOperation.parent_job_id == retry.id)
+            )
+        )
+    expected_nodes = set(nodes[1:] if first_node_removed else nodes)
+    assert {child.node_id for child in children} == expected_nodes
+    assert {child.payload["installation_id"] for child in children} == {target.owner_id}
+    assert {child.payload["plan_digest"] for child in children} == {target.plan_digest}
+    assert {child.payload["cleanup_model_content_sha256"] for child in children} == {
+        None if retain_shared_model else preview.model_impact.model_content_sha256
+    }
+    with sessions.begin() as session:
+        session.get(Job, retry.id).state = cleanup_state
+    assert (
+        recovered.start_installation(
+            target.owner_id, actor="admin", request_id=install_request
+        ).id
+        == target.id
+    )
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        recovered.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+    with pytest.raises(RecipeOperationConflict, match="stale or blocked"):
+        recovered.uninstall(
+            target.owner_id,
+            plan_digest=preview.plan_digest,
+            actor="admin",
+            request_id=str(uuid.uuid4()),
+        )
+    with sessions() as session:
+        assert session.get(RecipeInstallation, target.owner_id).state == "failed"
+        assert set(
+            session.scalars(
+                select(InstallationNode.state).where(
+                    InstallationNode.installation_id == target.owner_id
+                )
+            )
+        ) == ({"uninstalled", "failed"} if first_node_removed else {"failed"})
+    active = recovered.preview_uninstall(target.owner_id)
+    if cleanup_state == "waiting-for-operator" or first_node_removed:
+        assert active.allowed is False
+        assert "uninstall.operation_active" in [
+            reason.code for reason in active.blockers
+        ]
+    else:
+        assert active.allowed is True
+        assert "uninstall.operation_active" not in [
+            reason.code for reason in active.blockers
+        ]
+    for node_id in expected_nodes:
+        recovered.record_node_result(
+            retry.id, node_id, succeeded=True, evidence={"removed": True}
+        )
+    assert recovered.get(retry.id).state == "succeeded"
+    with sessions() as session:
+        installed = session.get(RecipeInstallation, target.owner_id)
+        assert installed is not None and installed.state == "uninstalled"
+        assert set(
+            session.scalars(
+                select(InstallationNode.state).where(
+                    InstallationNode.installation_id == target.owner_id
+                )
+            )
+        ) == {"uninstalled"}
+        assert not list(
+            session.scalars(
+                select(ResourceReservation).where(
+                    ResourceReservation.owner_id == target.owner_id,
+                    ResourceReservation.state == "active",
+                )
+            )
+        )
+        if retained is not None:
+            other = session.get(RecipeInstallation, retained.owner_id)
+            assert other is not None and other.state == "installed"
+            assert list(
+                session.scalars(
+                    select(ResourceReservation).where(
+                        ResourceReservation.owner_id == retained.owner_id,
+                        ResourceReservation.state == "active",
+                    )
+                )
+            )
+
+
+def test_resolved_uninstall_cancellation_does_not_fence_a_new_install(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(
+        tmp_path, nodes=2
+    )
+    install_request = str(uuid.uuid4())
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=install_request
+    )
+    initial = service.preview_uninstall(target.owner_id)
+    first = service.uninstall(
+        target.owner_id,
+        plan_digest=initial.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    service.record_node_result(
+        first.id, nodes[0], succeeded=False, evidence={"code": "cleanup.failed"}
+    )
+    service.record_node_result(
+        first.id, nodes[1], succeeded=False, evidence={"code": "cleanup.failed"}
+    )
+    assert service.get(first.id).state == "failed"
+    retry_preview = service.preview_uninstall(target.owner_id)
+    retry = service.uninstall(
+        target.owner_id,
+        plan_digest=retry_preview.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    cancelled = service.cancel(
+        retry.id,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+        reason="operator withdrew unresolved cleanup",
+    )
+    assert cancelled.state == "cancelled"
+    replay = service.start_installation(
+        target.owner_id, actor="admin", request_id=install_request
+    )
+    assert replay.id == target.id
+    restarted = service.start_installation(
+        target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+    )
+    assert restarted.kind == "recipe.install"
+    assert restarted.id != target.id
+    assert restarted.state in {"queued", "running"}
+    with sessions() as session:
+        installation = session.get(RecipeInstallation, target.owner_id)
+        assert installation is not None and installation.state == "installing"
+        assert _required(session.get(Job, retry.id)).state == "cancelled"
+
+
+def test_waiting_uninstall_cancel_request_still_fences_new_install(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    install_request = str(uuid.uuid4())
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=install_request
+    )
+    plan = service.preview_uninstall(target.owner_id)
+    uninstall = service.uninstall(
+        target.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    with sessions.begin() as session:
+        child = session.scalar(
+            select(AgentOperation).where(AgentOperation.parent_job_id == uninstall.id)
+        )
+        assert child is not None
+        child.state = "running"
+        child.current_attempt = 1
+        session.add(
+            AgentOperationAttempt(
+                operation_id=child.id,
+                attempt=1,
+                fence=str(uuid.uuid4()),
+                lease_deadline=NOW + timedelta(minutes=1),
+                agent_certificate_serial="serial-0",
+                state="running",
+            )
+        )
+    cancelling = service.cancel(
+        uninstall.id,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+        reason="superseded cleanup still has issued effects",
+    )
+    assert cancelling.state == "running"
+    with sessions.begin() as session:
+        job = _required(session.get(Job, uninstall.id))
+        job.state = "waiting-for-operator"
+        assert job.result is not None and job.result["cancel_requested"] is True
+    assert (
+        service.start_installation(
+            target.owner_id, actor="admin", request_id=install_request
+        ).id
+        == target.id
+    )
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        service.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+    blocked = service.preview_uninstall(target.owner_id)
+    assert blocked.allowed is False
+    assert "uninstall.operation_active" in [reason.code for reason in blocked.blockers]
+
+
+def _park_waiting_uninstall(
+    sessions: sessionmaker[Session],
+    uninstall_id: str,
+    *,
+    issue_attempt: bool,
+    lease_deadline: datetime = NOW + timedelta(minutes=1),
+    drop_ordinal: bool = False,
+) -> None:
+    """Park an uninstall as waiting-for-operator with or without attempt proof."""
+
+    with sessions.begin() as session:
+        job = _required(session.get(Job, uninstall_id))
+        children = tuple(
+            session.scalars(
+                select(AgentOperation).where(
+                    AgentOperation.parent_job_id == uninstall_id
+                )
+            )
+        )
+        for child in children:
+            child.state = "waiting-for-operator"
+            child.current_attempt = 1 if issue_attempt else 0
+            if issue_attempt:
+                session.add(
+                    AgentOperationAttempt(
+                        operation_id=child.id,
+                        attempt=1,
+                        fence=str(uuid.uuid4()),
+                        lease_deadline=lease_deadline,
+                        agent_certificate_serial="serial-0",
+                        state="running",
+                    )
+                )
+        job.state = "waiting-for-operator"
+        if drop_ordinal:
+            payload = dict(job.payload)
+            payload.pop("workload_intent_ordinal", None)
+            job.payload = payload
+
+
+def test_failed_install_retry_is_fenced_by_active_uninstall(tmp_path: Path) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    plan = service.preview_install(mapping_id, build_id)
+    first = service.install(
+        plan, plan_digest=plan.plan_digest, actor="admin", request_id=str(uuid.uuid4())
+    )
+    service.record_node_result(
+        first.id, nodes[0], succeeded=False, evidence={"code": "pull.failed"}
+    )
+    assert service.get(first.id).state == "failed"
+    retry_key = str(uuid.uuid4())
+    retry = service.retry(first.id, actor="admin", request_id=retry_key)
+    assert retry.id != first.id
+    assert service.retry(first.id, actor="admin", request_id=retry_key).id == retry.id
+    service.record_node_result(
+        retry.id, nodes[0], succeeded=False, evidence={"code": "pull.failed"}
+    )
+    assert service.get(retry.id).state == "failed"
+    uninstall_plan = service.preview_uninstall(first.owner_id)
+    uninstall = service.uninstall(
+        first.owner_id,
+        plan_digest=uninstall_plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    assert service.get(uninstall.id).state in {"queued", "running"}
+    assert service.retry(first.id, actor="admin", request_id=retry_key).id == retry.id
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        service.retry(first.id, actor="admin", request_id=str(uuid.uuid4()))
+    with sessions() as session:
+        install_jobs = tuple(
+            session.scalars(
+                select(Job).where(
+                    Job.kind == "recipe.install",
+                    ~Job.id.in_((first.id, retry.id)),
+                )
+            )
+        )
+    assert install_jobs == ()
+
+
+def test_waiting_uninstall_cancel_persists_until_native_observation(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    install_request = str(uuid.uuid4())
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=install_request
+    )
+    plan = service.preview_uninstall(target.owner_id)
+    uninstall = service.uninstall(
+        target.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    _park_waiting_uninstall(sessions, uninstall.id, issue_attempt=True)
+    pending = service.assess_superseded_issued("recipe.uninstall", target.owner_id)
+    assert pending is not None and pending.job_id == uninstall.id
+    cancel_key = str(uuid.uuid4())
+    cancelling = service.cancel(
+        uninstall.id,
+        actor="admin",
+        request_id=cancel_key,
+        reason="operator withdrew uncertain cleanup",
+    )
+    assert cancelling.state == "waiting-for-operator"
+    assert _required(cancelling.result)["cancel_requested"] is True
+    assert (
+        service.cancel(
+            uninstall.id,
+            actor="admin",
+            request_id=cancel_key,
+            reason="operator withdrew uncertain cleanup",
+        ).state
+        == "waiting-for-operator"
+    )
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        service.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+    service.record_node_result(
+        uninstall.id, nodes[0], succeeded=True, evidence={"removed": True}
+    )
+    assert service.get(uninstall.id).state == "succeeded"
+    with sessions() as session:
+        installation = _required(session.get(RecipeInstallation, target.owner_id))
+        assert installation.state == "uninstalled"
+
+
+def test_waiting_uninstall_unissued_cancel_resolves_and_lifts_fence(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+    )
+    plan = service.preview_uninstall(target.owner_id)
+    uninstall = service.uninstall(
+        target.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    with sessions.begin() as session:
+        _required(session.get(Job, uninstall.id)).state = "waiting-for-operator"
+    cancelled = service.cancel(
+        uninstall.id,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+        reason="operator withdrew unissued cleanup",
+    )
+    assert cancelled.state == "cancelled"
+    assert service.preview_uninstall(target.owner_id).allowed is True
+    run_plan = service.preview_run(target.owner_id, "after-cancel")
+    restarted = service.start(
+        run_plan,
+        plan_digest=run_plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    assert restarted.kind == "recipe.start"
+
+
+def test_waiting_uninstall_without_authority_proof_stays_blocked_and_cancellable(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+    )
+    plan = service.preview_uninstall(target.owner_id)
+    uninstall = service.uninstall(
+        target.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    _park_waiting_uninstall(
+        sessions, uninstall.id, issue_attempt=False, drop_ordinal=True
+    )
+    assert service.assess_superseded_issued("recipe.uninstall", target.owner_id) is None
+    blocked = service.preview_uninstall(target.owner_id)
+    assert blocked.allowed is False
+    assert "uninstall.operation_active" in [reason.code for reason in blocked.blockers]
+    cancelling = service.cancel(
+        uninstall.id,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+        reason="operator cancelled unproven waiting cleanup",
+    )
+    assert cancelling.state == "waiting-for-operator"
+    assert _required(cancelling.result)["cancel_requested"] is True
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        service.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+
+
+def test_expired_uninstall_lease_does_not_resolve_waiting_cleanup(
+    tmp_path: Path,
+) -> None:
+    sessions, service, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    target = installed_recipe(
+        service, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+    )
+    plan = service.preview_uninstall(target.owner_id)
+    uninstall = service.uninstall(
+        target.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    _park_waiting_uninstall(
+        sessions,
+        uninstall.id,
+        issue_attempt=True,
+        lease_deadline=NOW - timedelta(hours=1),
+    )
+    pending = service.assess_superseded_issued("recipe.uninstall", target.owner_id)
+    assert pending is not None and pending.job_id == uninstall.id
+    assert pending.observation_deadline < NOW
+    with pytest.raises(RecipeOperationConflict, match="active uninstall"):
+        service.start_installation(
+            target.owner_id, actor="admin", request_id=str(uuid.uuid4())
+        )
+    cancelling = service.cancel(
+        uninstall.id,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+        reason="expired lease is not a stop receipt",
+    )
+    assert cancelling.state == "waiting-for-operator"
+    with sessions() as session:
+        assert _required(session.get(Job, uninstall.id)).state == "waiting-for-operator"
+        assert (
+            _required(session.get(RecipeInstallation, target.owner_id)).state
+            == "installed"
+        )
+
+
+@pytest.mark.parametrize("native_succeeded", [False, True])
+def test_run_switch_cleanup_observes_waiting_uninstall_before_resume(
+    tmp_path: Path,
+    native_succeeded: bool,
+) -> None:
+    from .test_run_switch_operations import (
+        CompleteArtifactInspector,
+        RecordingArtifactExecutor,
+    )
+
+    sessions, operations, _queue, mapping_id, build_id, nodes = setup_services(tmp_path)
+    installation = installed_recipe(
+        operations, mapping_id, build_id, nodes, request_id=str(uuid.uuid4())
+    )
+    plan = operations.preview_uninstall(installation.owner_id)
+    uninstall = operations.uninstall(
+        installation.owner_id,
+        plan_digest=plan.plan_digest,
+        actor="admin",
+        request_id=str(uuid.uuid4()),
+    )
+    _park_waiting_uninstall(sessions, uninstall.id, issue_attempt=True)
+    current = {"now": NOW}
+
+    def clock() -> datetime:
+        return current["now"]
+
+    operations._clock = clock
+    switch = RunSwitchOperationService(
+        sessions,
+        lifecycle=operations,
+        clock=clock,
+        artifacts=CompleteArtifactInspector(),
+        artifact_phase_executor=RecordingArtifactExecutor(),
+        memory_floor_bytes=50,
+    )
+    preview = switch.preview_cleanup(installation.owner_id, actor="admin")
+    assert preview.allowed is True, [reason.code for reason in preview.blockers]
+    assert "run-switch.uninstall-issued-prerequisite" in [
+        reason.code for reason in preview.warnings
+    ]
+    assert not any(
+        reason.code == "run-switch.uninstall-blocked" for reason in preview.blockers
+    )
+    operation = switch.apply_cleanup(
+        RunSwitchCleanupApplyRequest(
+            installation_id=installation.owner_id,
+            request_key=str(uuid.uuid4()),
+        ),
+        actor="admin",
+    )
+    assert switch.tick() is True
+    held = switch.get(operation.operation_id)
+    assert held.state == "running"
+    assert "Observing older issued lifecycle operation" in (held.status_reason or "")
+    with sessions() as session:
+        uninstalls = tuple(
+            session.scalars(select(Job).where(Job.kind == "recipe.uninstall"))
+        )
+    assert [job.id for job in uninstalls] == [uninstall.id]
+    operations.record_node_result(
+        uninstall.id,
+        nodes[0],
+        succeeded=native_succeeded,
+        evidence={"removed": True} if native_succeeded else {"code": "cleanup.failed"},
+    )
+    assert operations.get(uninstall.id).state == (
+        "succeeded" if native_succeeded else "failed"
+    )
+    current["now"] = NOW + timedelta(seconds=30)
+    child_id = None
+    for _ in range(4):
+        switch.tick()
+        view = switch.get(operation.operation_id)
+        child_id = None if view.result is None else view.result.child_operation_id
+        if child_id is not None:
+            break
+    if native_succeeded:
+        assert child_id is None
+        with sessions() as session:
+            assert (
+                session.query(Job).filter(Job.kind == "recipe.uninstall").count() == 1
+            )
+    else:
+        assert child_id is not None and child_id != uninstall.id
+        operations.record_node_result(
+            child_id, nodes[0], succeeded=True, evidence={"removed": True}
+        )
+    for _ in range(4):
+        if switch.get(operation.operation_id).state == "succeeded":
+            break
+        switch.tick()
+    assert switch.get(operation.operation_id).state == "succeeded", switch.get(
+        operation.operation_id
+    ).model_dump_json()
+    with sessions() as session:
+        assert (
+            _required(session.get(RecipeInstallation, installation.owner_id)).state
+            == "uninstalled"
+        )
 
 
 def test_run_status_projects_exact_rank_health_without_agent_secrets(
@@ -5581,8 +6207,9 @@ def test_postgres_duplicate_uninstall_rechecks_replay_after_installation_lock(
     assert {child.node_id for child in children} == set(nodes)
 
 
+@pytest.mark.parametrize("operation", ["run", "install"])
 def test_postgres_start_waiting_on_accepted_uninstall_is_rejected(
-    tmp_path: Path, postgres_engine
+    tmp_path: Path, postgres_engine, operation: str
 ) -> None:
     Base.metadata.drop_all(postgres_engine)
     sessions, service, queue, mapping_id, build_id, nodes = setup_services(
@@ -5631,6 +6258,12 @@ def test_postgres_start_waiting_on_accepted_uninstall_is_rejected(
     def start():
         role.value = "start"
         try:
+            if operation == "install":
+                return service.start_installation(
+                    installation.owner_id,
+                    actor="admin",
+                    request_id="f" * 35 + "6",
+                )
             return service.start(
                 run_plan,
                 plan_digest=run_plan.plan_digest,
@@ -5663,11 +6296,18 @@ def test_postgres_start_waiting_on_accepted_uninstall_is_rejected(
         event.remove(postgres_engine, "after_cursor_execute", after_lock)
 
     assert isinstance(start_result, RecipeOperationConflict)
-    assert "not runnable" in str(start_result)
+    assert ("not runnable" if operation == "run" else "active uninstall") in str(
+        start_result
+    )
     assert queue.available == available_before + 1
     with sessions() as session:
         start_jobs = tuple(
-            session.scalars(select(Job).where(Job.kind == "recipe.start"))
+            session.scalars(
+                select(Job).where(
+                    Job.kind.in_(["recipe.start", "recipe.install"]),
+                    Job.id != installation.id,
+                )
+            )
         )
         runs = tuple(session.scalars(select(RecipeRun)))
         uninstall_children = tuple(
