@@ -737,7 +737,6 @@ class TelemetryMaintenance:
                 metric.scope,
                 metric.device_id,
                 metric.process_id,
-                metric.process_name,
                 metric.interface_name,
                 metric.run_id,
                 metric.unit,
@@ -772,6 +771,13 @@ class TelemetryMaintenance:
                 high = max(current.maximum, incoming.maximum)
                 aggregates[identity] = replace(
                     current,
+                    # A mutable label is not part of the stable storage key.
+                    # Rows are ordered by bucket time; retain the latest label.
+                    process_name=(
+                        incoming.process_name
+                        if incoming.process_name is not None
+                        else current.process_name
+                    ),
                     count=current.count + incoming.count,
                     minimum=min(current.minimum, incoming.minimum),
                     mean=high,
@@ -782,6 +788,13 @@ class TelemetryMaintenance:
                 count = current.count + incoming.count
                 aggregates[identity] = replace(
                     current,
+                    # A mutable label is not part of the stable storage key.
+                    # Rows are ordered by bucket time; retain the latest label.
+                    process_name=(
+                        incoming.process_name
+                        if incoming.process_name is not None
+                        else current.process_name
+                    ),
                     count=count,
                     minimum=min(current.minimum, incoming.minimum),
                     mean=(current.mean * current.count + incoming.mean * incoming.count)
