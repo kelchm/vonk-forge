@@ -264,7 +264,10 @@ def assert_fork_overlay(
 def assert_nas_payload_images(payload: Path, images: Mapping[str, str]) -> None:
     document = _read_canonical_document(payload, "signed NAS payload")
     try:
-        services = yaml.safe_load(document["docker_compose_yaml"])["services"]
+        compose_text = document["docker_compose_yaml"]
+        if not isinstance(compose_text, str):
+            raise ValueError("Compose text is invalid")
+        services = yaml.safe_load(compose_text)["services"]
         if not isinstance(services, dict) or not services:
             raise ValueError("missing services")
         for service in services.values():

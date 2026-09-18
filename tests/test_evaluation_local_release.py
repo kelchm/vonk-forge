@@ -7,13 +7,13 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from tests.acceptance.evaluation_local_release import (
     EVALUATION_ORIGIN,
     EvaluationLocalLifecycle,
+    LocalReleaseArtifacts,
     assert_fork_images,
     assert_fork_overlay,
     assert_nas_payload_images,
@@ -492,9 +492,15 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
 ) -> None:
     run = EvaluationLocalLifecycle.__new__(EvaluationLocalLifecycle)
     run.temporary_root = tmp_path
-    run.arguments = SimpleNamespace(version="0.1.1~dev.609+g88480698a951")
+    run.arguments = argparse.Namespace(version="0.1.1~dev.609+g88480698a951")
     run.firewall_environment = {"VONK_NAS_MANAGEMENT_IP": "172.31.20.2"}
-    run.artifacts = SimpleNamespace(
+    run.artifacts = LocalReleaseArtifacts(
+        overlay=tmp_path / "overlay.yml",
+        nas_payload=tmp_path / "payload.json",
+        nas_setup=tmp_path / "vonk-nas-setup",
+        public_key=tmp_path / "public.pem",
+        graph={},
+        artifact_digests={},
         spark_setup=tmp_path / "vonk-spark-setup",
         package=tmp_path / "vonk-forge-agent.deb",
         release=tmp_path / "release.json",
@@ -523,18 +529,22 @@ def test_native_spark_setup_invocation_keeps_the_pairing_token_in_tty_answers(
         interactive=interactive,
     )
 
-    assert observed["command"][:2] == [
+    command = observed["command"]
+    environment = observed["environment"]
+    assert isinstance(command, list)
+    assert isinstance(environment, dict)
+    assert command[:2] == [
         os.fspath(run.artifacts.spark_setup),
         "--package",
     ]
-    staged = Path(observed["command"][2])
+    staged = Path(command[2])
     assert staged.name == "vonk-forge-agent_0.1.1~dev.609+g88480698a951_arm64.deb"
     assert staged.read_bytes() == run.artifacts.package.read_bytes()
     assert staged.stat().st_mode & 0o777 == 0o600
-    assert observed["command"][-1] == "--enroll"
+    assert command[-1] == "--enroll"
     assert "https://install.vonkforge.ai" not in repr(observed["command"])
-    assert "VONK_INSTALL_BASE_URL" not in observed["environment"]
-    assert observed["environment"]["VONK_CONTROLLER_ADDRESS"] == "127.0.0.1"
+    assert "VONK_INSTALL_BASE_URL" not in environment
+    assert environment["VONK_CONTROLLER_ADDRESS"] == "127.0.0.1"
     assert observed["responses"] == [
         ("Enrollment URL: ", "https://enroll.spark.localhost:8443"),
         ("Controller CA SHA-256: ", "a" * 64),
