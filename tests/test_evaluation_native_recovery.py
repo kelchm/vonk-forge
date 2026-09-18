@@ -698,11 +698,11 @@ def test_workflow_is_fork_only_manual_and_pins_both_sources() -> None:
     assert "workflow_dispatch:" in text
     assert "pull_request:" not in text
     assert "workflow_call:" not in text
-    assert "branches: [patch/evaluation-fabric-recovery]" in text
+    assert "branches: [patch/evaluation-recovery-609]" in text
     assert "kelchm/vonk-forge" in text
-    assert "github.ref == 'refs/heads/patch/evaluation-fabric-recovery'" in text
+    assert "github.ref == 'refs/heads/patch/evaluation-recovery-609'" in text
     assert "startsWith(github.ref" not in text
-    assert 'test "$GITHUB_REF" = refs/heads/patch/evaluation-fabric-recovery' in text
+    assert 'test "$GITHUB_REF" = refs/heads/patch/evaluation-recovery-609' in text
     assert "runs-on: ubuntu-24.04-arm" in text
     assert 'VONK_EVALUATION_DISPOSABLE: "1"' in text
     assert "contents: read" in text

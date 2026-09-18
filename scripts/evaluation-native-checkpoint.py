@@ -44,6 +44,7 @@ DIGEST_RE = HEX64
 
 NATIVE_UNITS = (
     "vonk-forge-agent.service",
+    "vonk-forge-monitor.service",
     "vonk-forge-package-helper.service",
     "vonk-forge-package-helper.socket",
     "vonk-forge-docker-firewall.service",
@@ -70,6 +71,7 @@ SHARED_PARENTS = {
 PACKAGE_OWNED_FILE_ROOTS = {
     "/etc/vonk-forge-agent/containers-storage.conf",
     "/lib/systemd/system/vonk-forge-agent.service",
+    "/lib/systemd/system/vonk-forge-monitor.service",
     "/lib/systemd/system/vonk-forge-docker-firewall.service",
     "/lib/systemd/system/vonk-forge-package-helper.service",
     "/lib/systemd/system/vonk-forge-package-helper.socket",
@@ -79,10 +81,14 @@ PACKAGE_OWNED_FILE_ROOTS = {
 }
 PACKAGE_OWNED_DIR_ROOTS = {
     "/etc/systemd/system/vonk-forge-agent.service.d",
+    "/etc/systemd/system/vonk-forge-monitor.service.d",
+    "/etc/systemd/system/vonk-forge-package-rollback.service.d",
     "/etc/systemd/system/vonk-forge-docker-firewall.service.d",
     "/etc/systemd/system/vonk-forge-package-helper.service.d",
     "/etc/systemd/system/vonk-forge-package-helper.socket.d",
     "/lib/systemd/system/vonk-forge-agent.service.d",
+    "/lib/systemd/system/vonk-forge-monitor.service.d",
+    "/lib/systemd/system/vonk-forge-package-rollback.service.d",
     "/lib/systemd/system/vonk-forge-package-helper.socket.d",
     "/lib/systemd/system/vonk-forge-package-upgrade-recover.service.d",
     "/usr/lib/vonk-forge",
@@ -90,6 +96,8 @@ PACKAGE_OWNED_DIR_ROOTS = {
 }
 ADMIN_DROPIN_ROOTS = (
     "/etc/systemd/system/vonk-forge-agent.service.d",
+    "/etc/systemd/system/vonk-forge-monitor.service.d",
+    "/etc/systemd/system/vonk-forge-package-rollback.service.d",
     "/etc/systemd/system/vonk-forge-docker-firewall.service.d",
     "/etc/systemd/system/vonk-forge-package-helper.service.d",
     "/etc/systemd/system/vonk-forge-package-helper.socket.d",
@@ -411,7 +419,8 @@ def allowed_symlink(link_absolute: str, target: str) -> bool:
         re.fullmatch(
             r"/var/lib/vonk-forge-agent/runs/[0-9a-f-]{36}/outputs/.+",
             link_absolute,
-        ) is not None
+        )
+        is not None
         and target.startswith("/models/")
         and resolved == target
         and ".." not in PurePosixPath(target).parts

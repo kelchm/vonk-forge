@@ -416,7 +416,10 @@ def test_checkpoint_and_apply_restore_fixture_bytes(
 ) -> None:
     """Fixture-root byte restore only; not physical native recovery evidence."""
     runtime, world, checkpoint_dir = harness
-    output = world.root / "var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model"
+    output = (
+        world.root
+        / "var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model"
+    )
     output.mkdir(parents=True)
     os.symlink("/models/weights.bin", output / "weights.bin")
     cache = output.parent / "cache/ple/weights"
@@ -943,8 +946,58 @@ def test_package_file_list_accepts_dpkg_usr_merge_annotation(module, harness):
         module.dpkg_file_list(runtime)
 
 
-@pytest.mark.parametrize("target", ["/etc/passwd", "/models/../etc/passwd", "/models//weights"])
+@pytest.mark.parametrize(
+    "target", ["/etc/passwd", "/models/../etc/passwd", "/models//weights"]
+)
 def test_container_model_link_exception_rejects_escape(module, target):
     link = "/var/lib/vonk-forge-agent/runs/12345678-1234-4234-8234-123456789abc/outputs/model/link"
     assert not module.allowed_symlink(link, target)
     assert not module.allowed_symlink("/etc/vonk-forge-agent/link", "/models/weights")
+
+
+@pytest.mark.parametrize(
+    "unit", ["vonk-forge-monitor.service", "vonk-forge-package-rollback.service"]
+)
+def test_new_native_unit_must_stop_before_checkpoint_or_restore(module, harness, unit):
+    runtime, world, checkpoint_dir = harness
+    world.units[unit] = "active"
+    code, report = run_cli(module, runtime, ["--checkpoint-dir", str(checkpoint_dir)])
+    assert code == 1 and not report["mutated"]
+    world.units[unit] = "inactive"
+    baseline = checkpoint_ok(module, runtime, checkpoint_dir)
+    upgrade(world)
+    world.units[unit] = "active"
+    code, report = run_cli(
+        module, runtime, [*restore_args(checkpoint_dir, baseline), "--apply"]
+    )
+    assert code == 1 and not report["mutated"]
+    assert (world.root / "usr/lib/vonk-forge/vonk-agent").read_bytes() == NEW_AGENT
+
+
+def test_candidate_monitor_files_are_removed_by_exact_checkpoint_restore(
+    module, harness
+):
+    runtime, world, checkpoint_dir = harness
+    baseline = checkpoint_ok(module, runtime, checkpoint_dir)
+    upgrade(world)
+    additions = [
+        "/usr/lib/vonk-forge/vonk-monitor",
+        "/lib/systemd/system/vonk-forge-monitor.service",
+        "/lib/systemd/system/vonk-forge-package-rollback.service",
+    ]
+    for path in additions:
+        write(
+            world.root / path.lstrip("/"),
+            b"candidate native component\n",
+            0o555 if path.endswith("vonk-monitor") else 0o644,
+        )
+    world.package_files.extend(additions)
+    code, report = run_cli(
+        module, runtime, [*restore_args(checkpoint_dir, baseline), "--apply"]
+    )
+    assert code == 0, report
+    assert all(not (world.root / path.lstrip("/")).exists() for path in additions)
+    assert (world.root / "usr/lib/vonk-forge/vonk-agent").read_bytes() == OLD_AGENT
+    assert (
+        world.root / "var/lib/vonk-forge-agent/models/weights.bin"
+    ).read_bytes() == b"model-still-here\n"

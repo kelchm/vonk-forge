@@ -1,7 +1,7 @@
 name: Fork evaluation native recovery
 on:
   push:
-    branches: [patch/evaluation-fabric-recovery]
+    branches: [patch/evaluation-recovery-609]
   workflow_dispatch:
     inputs:
       current_bundle_tag:
@@ -44,7 +44,7 @@ permissions:
   contents: read
 jobs:
   recovery:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && github.ref == 'refs/heads/patch/evaluation-fabric-recovery'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'kelchm/vonk-forge' && github.ref == 'refs/heads/patch/evaluation-recovery-609'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = kelchm/vonk-forge
-          test "$GITHUB_REF" = refs/heads/patch/evaluation-fabric-recovery
+          test "$GITHUB_REF" = refs/heads/patch/evaluation-recovery-609
           [[ "$CURRENT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$BASELINE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$CURRENT_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
