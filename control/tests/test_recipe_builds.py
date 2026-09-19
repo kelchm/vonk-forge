@@ -14,7 +14,7 @@ import pytest
 import vonk_control.availability_production as availability_production_module
 import vonk_control.recipe_builds as recipe_builds_module
 import vonk_control.runtime_adapters as runtime_adapters_module
-from sqlalchemy import Table, create_engine, select
+from sqlalchemy import Engine, Table, create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from vonk_agent_protocol import (
     AgentClaim,
@@ -128,8 +128,14 @@ def test_build_disk_reserve_scales_to_the_spark_cap() -> None:
     assert recipe_builds_module._build_disk_reserve(4 * 1024**4) == 64 * 1024**3
 
 
-def setup(tmp_path: Path, *, network: dict[str, object] | None = None):
-    engine = create_engine(f"sqlite:///{tmp_path / 'build.sqlite'}")
+def setup(
+    tmp_path: Path,
+    *,
+    network: dict[str, object] | None = None,
+    engine: Engine | None = None,
+):
+    if engine is None:
+        engine = create_engine(f"sqlite:///{tmp_path / 'build.sqlite'}")
     Base.metadata.create_all(engine)
     sessions = sessionmaker(engine, expire_on_commit=False)
     now = datetime(2026, 8, 7, 12, tzinfo=UTC)
@@ -1145,8 +1151,9 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
     tmp_path: Path,
     source_state: str,
     outcome: str,
+    engine: Engine | None = None,
 ) -> None:
-    sessions, bundles, now, node_id, revision = setup(tmp_path)
+    sessions, bundles, now, node_id, revision = setup(tmp_path, engine=engine)
     builds = RecipeBuildService(sessions, bundles=bundles)
     plan = builds.plan(revision.id, node_id, now=now)
     operations = RecipeOperationService(
@@ -1221,6 +1228,8 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
             and cleanup_child.payload["operation_id"] == child_id
         )
     assert not operations.reconcile_cancelled_builds()
+    with pytest.raises(RecipeBuildError, match="cleanup is not complete"):
+        builds.plan(revision.id, node_id, now=now)
     # A late execution result must not publish the removed image, lose the
     # cancellation metadata, or release the reservation before cleanup.
     operations.record_node_result(
@@ -1282,6 +1291,27 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
         else:
             assert remaining is not None
             assert original_job.state == "waiting-for-operator"
+    if outcome == "success":
+        recovered = builds.plan(revision.id, node_id, now=now)
+        assert recovered.build_id == plan.build_id
+        assert recovered.build_input_sha256 == plan.build_input_sha256
+        RecipeBuildRequest.model_validate_json(json.dumps(recovered.agent_payload))
+        assert "cancelled" not in recovered.agent_payload
+        resumed = operations.build(
+            recovered,
+            build_input_sha256=recovered.build_input_sha256,
+            actor="admin",
+            request_id="build-after-confirmed-cleanup",
+        )
+        assert resumed.id != original.id
+        with sessions() as session:
+            cancelled_job = session.get(Job, original.id)
+            current_build = session.get(RecipeBuild, plan.build_id)
+            assert cancelled_job is not None and cancelled_job.state == "cancelled"
+            assert current_build is not None and current_build.state == "building"
+    else:
+        with pytest.raises(RecipeBuildError, match="cleanup is not complete"):
+            builds.plan(revision.id, node_id, now=now)
 
 
 @pytest.mark.parametrize(
@@ -2257,4 +2287,16 @@ def test_persisted_canonical_settings_preserve_build_identity_and_rebuild_change
     assert (
         service.plan(changed.id, node_id, now=now).build_input_sha256
         != first.build_input_sha256
+    )
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed"])
+def test_cancelled_build_rebuild_postgres(
+    tmp_path: Path, postgres_engine: Engine, outcome: str
+) -> None:
+    test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
+        tmp_path,
+        "waiting-for-operator",
+        outcome,
+        engine=postgres_engine,
     )

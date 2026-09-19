@@ -33,6 +33,7 @@ from .models import (
     CatalogDocumentRevision,
     ClusterMapping,
     ClusterMappingNode,
+    Job,
     RecipeBuild,
     RecipeSourceBundle,
     ResourceReservation,
@@ -41,6 +42,7 @@ from .recipe_execution_contract import (
     RecipeExecutionContractError,
     build_plan_document,
     build_policy_document,
+    build_request_document,
     parse_stored_build_plan,
     parse_stored_build_policy,
 )
@@ -1066,8 +1068,49 @@ class RecipeBuildService:
             session.flush()
         elif existing.recipe_revision_id == plan.recipe_revision_id:
             try:
-                payload = build_plan_document(existing.plan)
+                stored = parse_stored_build_plan(existing.plan)
                 parse_stored_build_policy(existing.policy_report)
+                if stored.cancelled is True:
+                    pending = session.scalar(
+                        select(Job.id)
+                        .where(
+                            Job.kind.in_(
+                                ("recipe.build.v1", "recipe.build.cleanup.v1")
+                            ),
+                            Job.payload["owner_id"].as_string() == existing.id,
+                            Job.state.not_in(("cancelled", "succeeded", "failed")),
+                        )
+                        .limit(1)
+                    )
+                    reserved = session.scalar(
+                        select(ResourceReservation.id)
+                        .where(
+                            ResourceReservation.owner_kind == "recipe-build",
+                            ResourceReservation.owner_id == existing.id,
+                            ResourceReservation.state == "active",
+                        )
+                        .limit(1)
+                    )
+                    if (
+                        existing.state != "failed"
+                        or pending is not None
+                        or reserved is not None
+                    ):
+                        raise RecipeBuildError(
+                            "build.cleanup_pending",
+                            "cancelled build cleanup is not complete",
+                        )
+                    payload = build_request_document(
+                        stored.model_dump(
+                            mode="json", exclude={"cancelled", "removal_fence"}
+                        )
+                    )
+                    existing.plan = build_plan_document(payload)
+                    existing.state = "planned"
+                    existing.error = None
+                    existing.updated_at = now
+                else:
+                    payload = build_request_document(stored)
             except RecipeExecutionContractError as error:
                 raise RecipeBuildError(
                     "build.plan_invalid", "stored source build envelope is invalid"
@@ -1172,7 +1215,7 @@ class RecipeBuildService:
             )
         try:
             stored_policy = parse_stored_build_policy(build.policy_report)
-            parse_stored_build_plan(build.plan)
+            build_request_document(build.plan)
             requested_plan = parse_stored_build_plan(plan.agent_payload)
         except RecipeExecutionContractError as error:
             raise RecipeBuildError(
@@ -1210,7 +1253,7 @@ class RecipeBuildService:
             raise RecipeBuildError(
                 "build.inventory_stale", "builder inventory is stale"
             )
-        plan_payload = build_plan_document(requested_plan)
+        plan_payload = build_request_document(requested_plan)
         limits = plan_payload.get("limits")
         source_bytes = plan_payload.get("source_bundle_bytes")
         if not isinstance(limits, dict) or not isinstance(source_bytes, int):

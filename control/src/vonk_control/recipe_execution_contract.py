@@ -209,9 +209,29 @@ def run_plan_document(value: object) -> dict[str, object]:
     return _document(parse_stored_run_plan(value))
 
 
-def parse_stored_build_plan(value: object) -> RecipeBuildRequest:
+class StoredBuildPlan(RecipeBuildRequest):
+    """Current stored build request plus Controller-owned cancellation state."""
+
+    cancelled: Literal[True] | None = None
+    removal_fence: UuidId | None = None
+
+    @field_validator("cancelled", mode="before")
+    @classmethod
+    def cancellation_is_exact_boolean(cls, value: object) -> object:
+        if value is not None and value is not True:
+            raise ValueError("build cancellation must be true or null")
+        return value
+
+    @model_validator(mode="after")
+    def removal_requires_cancellation(self) -> StoredBuildPlan:
+        if self.removal_fence is not None and self.cancelled is not True:
+            raise ValueError("build removal requires cancellation")
+        return self
+
+
+def parse_stored_build_plan(value: object) -> StoredBuildPlan:
     try:
-        return RecipeBuildRequest.model_validate_json(canonical_message(value))
+        return StoredBuildPlan.model_validate_json(canonical_message(value))
     except (TypeError, ValueError) as error:
         raise RecipeExecutionContractError(
             "stored recipe build plan is invalid"
@@ -220,6 +240,19 @@ def parse_stored_build_plan(value: object) -> RecipeBuildRequest:
 
 def build_plan_document(value: object) -> dict[str, object]:
     return json.loads(canonical_message(parse_stored_build_plan(value)))
+
+
+def build_request_document(value: object) -> dict[str, object]:
+    """Project a live stored plan onto the canonical native request."""
+    stored = parse_stored_build_plan(value)
+    if stored.cancelled is True:
+        raise RecipeExecutionContractError("stored recipe build is cancelled")
+    request = RecipeBuildRequest.model_validate_json(
+        canonical_message(
+            stored.model_dump(mode="json", exclude={"cancelled", "removal_fence"})
+        )
+    )
+    return json.loads(canonical_message(request))
 
 
 def parse_stored_build_policy(value: object) -> StoredBuildPolicyReport:

@@ -71,7 +71,7 @@ from .preparation_contract import (
 from .recipe_builds import RecipeBuildPlan
 from .recipe_execution_contract import (
     RecipeExecutionContractError,
-    build_plan_document,
+    build_request_document,
     parse_stored_build_plan,
     run_plan_document,
 )
@@ -1117,7 +1117,7 @@ class RecipeLifecyclePhaseExecutor:
             build_input_sha256 = build.build_input_sha256
             source_bundle_sha256 = build.source_bundle_sha256
             try:
-                stored_plan = build_plan_document(build.plan)
+                stored_plan = build_request_document(build.plan)
             except RecipeExecutionContractError as error:
                 raise RunSwitchOperationConflict(
                     "run-switch.container-build-plan-invalid"

@@ -81,6 +81,7 @@ from .recipe_builds import RecipeBuildPlan, RecipeBuildService
 from .recipe_execution_contract import (
     RecipeExecutionContractError,
     build_plan_document,
+    build_request_document,
     installation_plan_document,
     parse_stored_build_plan,
     parse_stored_build_policy,
@@ -2295,7 +2296,7 @@ class RecipeOperationService:
         if active:
             raise RecipeOperationConflict("recipe build already has an active retry")
         try:
-            payload = build_plan_document(build.plan)
+            payload = build_request_document(build.plan)
             parsed_payload = parse_stored_build_plan(payload)
             plan = RecipeBuildPlan(
                 build_id=owner_id,
@@ -3313,7 +3314,7 @@ class RecipeOperationService:
                 )
                 job.status_reason = reason
                 job.updated_at = now
-            build.plan = {**build.plan, "cancelled": True}
+            build.plan = build_plan_document({**build.plan, "cancelled": True})
             build.state = "failed"
             build.error = reason
             build.updated_at = now

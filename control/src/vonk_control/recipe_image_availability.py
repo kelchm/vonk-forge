@@ -41,6 +41,7 @@ from .models import (
 )
 from .operation_contract import normalize_operation_progress, sanitize_failure_evidence
 from .operation_progress import aggregate_progress
+from .recipe_execution_contract import build_plan_document
 from .runtime_image_preparation import (
     OCIImageTransport,
     RuntimeImageReceipt,
@@ -658,7 +659,9 @@ class RecipeImageAvailabilityService:
             )
             for build in builds:
                 plan = dict(build.plan) if isinstance(build.plan, Mapping) else {}
-                build.plan = plan | {"removal_fence": fence, "cancelled": True}
+                build.plan = build_plan_document(
+                    plan | {"removal_fence": fence, "cancelled": True}
+                )
                 build.state = "failed"
                 build.error = "recipe Controller cache removal cancelled the build"
                 build.updated_at = now

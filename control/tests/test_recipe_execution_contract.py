@@ -265,3 +265,35 @@ def test_installation_plan_payload_expectation_is_optional_and_byte_stable() -> 
     assert "required_payload_bytes" not in _plan_node(
         _installation_plan({"required_payload_bytes": None})
     )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"cancelled": True},
+        {"cancelled": True, "removal_fence": "00000000-0000-4000-8000-000000000003"},
+    ],
+)
+def test_cancelled_build_storage_round_trip_is_not_a_native_request(metadata):
+    from importlib.resources import files
+
+    from vonk_control.recipe_execution_contract import build_request_document
+
+    value = json.loads(
+        files("vonk_agent_protocol")
+        .joinpath("vectors", "recipe-build-claim-v1.json")
+        .read_text()
+    )["base_payload"]
+    stored = build_plan_document(value | metadata)
+    assert build_plan_document(json.loads(json.dumps(stored))) == stored
+    with pytest.raises(RecipeExecutionContractError, match="cancelled"):
+        build_request_document(stored)
+    for bad in [1, False, "true"]:
+        with pytest.raises(RecipeExecutionContractError):
+            build_plan_document(value | {"cancelled": bad})
+    with pytest.raises(RecipeExecutionContractError):
+        build_plan_document(value | {"cancelled": True, "unknown": 1})
+    with pytest.raises(RecipeExecutionContractError):
+        build_plan_document(
+            value | {"removal_fence": "00000000-0000-4000-8000-000000000003"}
+        )

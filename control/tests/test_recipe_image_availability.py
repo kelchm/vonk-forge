@@ -701,7 +701,11 @@ def test_remove_recipe_cancels_build_and_publishes_no_late_receipt(
                 build_input_sha256="f" * 64,
                 state="building",
                 policy_report={},
-                plan={},
+                plan=json.loads(
+                    files("vonk_agent_protocol")
+                    .joinpath("vectors", "recipe-build-claim-v1.json")
+                    .read_text()
+                )["base_payload"],
                 image_digest=None,
                 oci_layout_sha256=None,
                 image_bytes=None,
