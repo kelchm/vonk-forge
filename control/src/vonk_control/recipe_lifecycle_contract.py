@@ -32,6 +32,8 @@ from vonk_agent_protocol.contracts import TensorParallelStartEvidence
 from .library_contract import NodeId, UuidId
 from .strict_json import StrictJSONModel
 
+TERMINAL_RECIPE_JOB_STATES = frozenset({"succeeded", "failed", "expired", "cancelled"})
+
 
 class LifecycleModel(StrictJSONModel):
     """Strict response model shared by recipe lifecycle result projections."""

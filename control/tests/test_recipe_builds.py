@@ -1152,6 +1152,7 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
     source_state: str,
     outcome: str,
     engine: Engine | None = None,
+    historical_expired: bool = False,
 ) -> None:
     sessions, bundles, now, node_id, revision = setup(tmp_path, engine=engine)
     builds = RecipeBuildService(sessions, bundles=bundles)
@@ -1170,6 +1171,24 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
         actor="admin",
         request_id="cancel-build-test",
     )
+    if historical_expired:
+        with sessions.begin() as session:
+            previous = session.get(Job, original.id)
+            previous_build = session.get(RecipeBuild, plan.build_id)
+            assert previous is not None and previous_build is not None
+            previous.state = "expired"
+            previous_child = session.scalar(
+                select(AgentOperation).where(
+                    AgentOperation.parent_job_id == previous.id
+                )
+            )
+            assert previous_child is not None
+            previous_child.state = "expired"
+            previous_child.current_attempt = 1
+            previous_build.state = "failed"
+        original = operations.retry(
+            original.id, actor="admin", request_id="after-expired-build"
+        )
     with sessions.begin() as session:
         child = session.scalar(
             select(AgentOperation).where(AgentOperation.parent_job_id == original.id)
@@ -1185,11 +1204,29 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
         assert node is not None
         node.capabilities = [*node.capabilities, "recipe.build.cleanup.v1"]
     if source_state == "waiting-for-operator":
-        with sessions.begin() as session:
-            row = session.get(RecipeBuild, plan.build_id)
-            assert row is not None
-            row.state = "failed"
-            row.plan = {**row.plan, "cancelled": True}
+        production = build_recipe_image_availability(
+            sessions,
+            artifact_root=tmp_path / "artifacts",
+            managed_catalog_sync=None,
+            recipe_builds=builds,
+            recipe_operations=operations,
+            clock=lambda: now,
+        )
+        try:
+            removed = production.service.remove_selector(
+                "qwen3-vllm",
+                actor="admin",
+                request_id="remove-build-cache",
+                with_model=False,
+            )
+            assert removed["cancelled_builds"] == [plan.build_id]
+            assert "model-download" in _json_array(removed["preserved"])
+            with sessions() as session:
+                row = session.get(RecipeBuild, plan.build_id)
+                assert row is not None and row.plan["cancelled"] is True
+                assert row.plan["removal_fence"]
+        finally:
+            production.close()
         assert operations.reconcile_cancelled_builds()
     else:
         operations.cancel(
@@ -1297,6 +1334,7 @@ def test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
         assert recovered.build_input_sha256 == plan.build_input_sha256
         RecipeBuildRequest.model_validate_json(json.dumps(recovered.agent_payload))
         assert "cancelled" not in recovered.agent_payload
+        assert "removal_fence" not in recovered.agent_payload
         resumed = operations.build(
             recovered,
             build_input_sha256=recovered.build_input_sha256,
@@ -2299,4 +2337,14 @@ def test_cancelled_build_rebuild_postgres(
         "waiting-for-operator",
         outcome,
         engine=postgres_engine,
+        historical_expired=True,
+    )
+
+
+def test_cancelled_build_rearms_with_expired_history(tmp_path: Path) -> None:
+    test_cancelled_build_keeps_capacity_until_cleanup_is_confirmed(
+        tmp_path,
+        "waiting-for-operator",
+        "success",
+        historical_expired=True,
     )

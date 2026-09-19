@@ -91,6 +91,7 @@ from .recipe_execution_contract import (
     run_plan_document,
 )
 from .recipe_lifecycle_contract import (
+    TERMINAL_RECIPE_JOB_STATES,
     RecipeOperationCancellationResult,
     parse_recipe_lifecycle_result,
     validate_recipe_lifecycle_terminal,
@@ -287,10 +288,9 @@ class RecipeRunStatus:
     ranks: tuple[RecipeRunRankStatus, ...]
 
 
-_TERMINAL_JOB_STATES = frozenset({"succeeded", "failed", "expired", "cancelled"})
 _INITIAL_OBSERVATION_GRACE_SECONDS = 120
 _RETRYABLE_IMAGE_DISTRIBUTION_STATES = frozenset({"failed", "waiting-for-operator"})
-_RETRYABLE_IMAGE_OPERATION_STATES = _TERMINAL_JOB_STATES | frozenset(
+_RETRYABLE_IMAGE_OPERATION_STATES = TERMINAL_RECIPE_JOB_STATES | frozenset(
     {"waiting-for-operator"}
 )
 _MEMORY_RESERVATION_KINDS = frozenset({"unified-memory", "host-memory", "gpu-memory"})
@@ -2356,7 +2356,9 @@ class RecipeOperationService:
                 )
             )
             active_operations = tuple(
-                item for item in operations if item.state not in _TERMINAL_JOB_STATES
+                item
+                for item in operations
+                if item.state not in TERMINAL_RECIPE_JOB_STATES
             )
             operation = (
                 active_operations[0]
@@ -2778,7 +2780,7 @@ class RecipeOperationService:
             except DistributedLifecycleError as error:
                 recovery_error = error
                 for child in children:
-                    if child.state not in _TERMINAL_JOB_STATES:
+                    if child.state not in TERMINAL_RECIPE_JOB_STATES:
                         child.state = "failed"
                         child.updated_at = now
             phase_index = _current_phase_index(children, phases)
@@ -2791,7 +2793,8 @@ class RecipeOperationService:
                     child for child in children if child.id in phase_operations
                 )
                 if any(
-                    child.state not in _TERMINAL_JOB_STATES for child in phase_children
+                    child.state not in TERMINAL_RECIPE_JOB_STATES
+                    for child in phase_children
                 ):
                     job.state = "running"
                     job.updated_at = now
@@ -2818,7 +2821,7 @@ class RecipeOperationService:
                     job.state = "running"
                     job.updated_at = now
                     return True
-        terminal = all(child.state in _TERMINAL_JOB_STATES for child in children)
+        terminal = all(child.state in TERMINAL_RECIPE_JOB_STATES for child in children)
         if terminal:
             successful = sorted(
                 {child.node_id for child in children if child.state == "succeeded"}

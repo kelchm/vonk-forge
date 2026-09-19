@@ -46,6 +46,7 @@ from .recipe_execution_contract import (
     parse_stored_build_plan,
     parse_stored_build_policy,
 )
+from .recipe_lifecycle_contract import TERMINAL_RECIPE_JOB_STATES
 from .recipe_runtime_specs import RecipeRuntimeSpecError, recipe_topology
 from .runtime_adapters import (
     RuntimeAdapter,
@@ -1078,7 +1079,7 @@ class RecipeBuildService:
                                 ("recipe.build.v1", "recipe.build.cleanup.v1")
                             ),
                             Job.payload["owner_id"].as_string() == existing.id,
-                            Job.state.not_in(("cancelled", "succeeded", "failed")),
+                            Job.state.not_in(TERMINAL_RECIPE_JOB_STATES),
                         )
                         .limit(1)
                     )
